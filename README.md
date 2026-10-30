@@ -1,19 +1,4 @@
 
-### 2026년 10월
-- [2026-10-29 : My Second page is theses haha.](./TIL/2026/10/2026-10-29_My_Second_page_is_theses_haha..md)
-- [2026-10-29 : My test page is this.](./TIL/2026/10/2026-10-29_My_test_page_is_this..md)
-- [2026-10-29 : 테스트 페이지 TEST TEST](./TIL/2026/10/2026-10-29_테스트_페이지_TEST_TEST.md)
-
-
-### 2026년 10월
-- [2026-10-29 : My test page is this.](./TIL/2026/10/2026-10-29_My_test_page_is_this..md)
-- [2026-10-29 : 테스트 페이지 TEST TEST](./TIL/2026/10/2026-10-29_테스트_페이지_TEST_TEST.md)
-
-
-### 2026년 10월
-- [2026-10-29 : 테스트 페이지 TEST TEST](./TIL/2026/10/2026-10-29_테스트_페이지_TEST_TEST.md)
-
-
 # 📝 Notion To Github Template
 
 Notion 데이터베이스에 작성한 글을 매일 자동으로 GitHub 리포지토리에 백업하고, README에 목록을 업데이트해주는 자동화 템플릿입니다.
