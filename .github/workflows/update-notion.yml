@@ -26,10 +26,13 @@ jobs:
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
         run: python update_readme.py
         
-      - name: Commit and Push
-        run: |
-          git config --global user.name "${{ secrets.GIT_USER_NAME || 'GitHub Action' }}"
-          git config --global user.email "${{ secrets.GIT_USER_EMAIL || 'action@github.com' }}"
-          git add .
-          git commit -m "docs: update notion log" || exit 0
-          git push
+      - name: Commit and Push to GitHub Pages Repository
+        uses: cpina/github-action-push-to-another-repository@main
+        env:
+          SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
+        with:
+          destination-github-username: 'acestarkzip'
+          destination-repository-name: 'acestarkzip.github.io'
+          user-email: 'acestark.zip@gmail.com'
+          target-branch: 'main'
+  
