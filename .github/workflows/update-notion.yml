@@ -31,8 +31,10 @@ jobs:
         env:
           SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
         with:
+          source-directory: 'TIL'  # 내 레포지토리에서 노션 파일들이 생성되는 폴더 이름 (예: TIL 또는 docs 등 본인 환경에 맞게 수정)
           destination-github-username: 'acestarkzip'
           destination-repository-name: 'acestarkzip.github.io'
           user-email: 'acestark.zip@gmail.com'
+          target-directory: 'TIL'  # 상대방 블로그 레포지토리의 어디에 저장할지 지정
           target-branch: 'main'
   
