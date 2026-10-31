@@ -62,6 +62,10 @@ GITHUB_RAW_BASE_URL = os.environ.get(
     "https://raw.githubusercontent.com/acestarkzip/acestarkzip.github.io/main",
 ).strip().rstrip("/")
 
+# 각 문서별 _assets 폴더에 이미지 미리보기 갤러리 README.md를 자동 생성합니다.
+# GitHub 폴더 화면에서 PNG/GIF 파일명을 하나씩 열지 않고도 이미지를 확인할 수 있습니다.
+GENERATE_ASSET_GALLERY = True
+
 DEFAULT_README_TEMPLATE = f"""# 📝 My TIL Collection
 
 노션에서 작성된 TIL(Today I Learned)이 자동으로 업로드되는 저장소입니다.
@@ -496,7 +500,9 @@ def download_notion_file(
                     pass
 
             # 응답을 임시 파일에 쓴 뒤 실제 바이트에 맞춰 확장자를 결정합니다.
-            temp_path = asset_dir / f".{index_tag}_{label}.download"
+            # 블록 ID 일부를 임시 파일명에 넣어 중단/재시도 시 임시 파일 충돌을 피합니다.
+            block_tag = hashlib.sha1(str(block_id or url).encode("utf-8")).hexdigest()[:8]
+            temp_path = asset_dir / f".{index_tag}_{label}_{block_tag}.download"
             total = 0
             prefix = b""
             try:
@@ -504,8 +510,8 @@ def download_notion_file(
                     for chunk in response.iter_content(chunk_size=64 * 1024):
                         if not chunk:
                             continue
-                        if len(prefix) < 2048:
-                            prefix += chunk[: 2048 - len(prefix)]
+                        if len(prefix) < 4096:
+                            prefix += chunk[: 4096 - len(prefix)]
                         total += len(chunk)
                         if total > MAX_DOWNLOAD_SIZE_MB * 1024 * 1024:
                             raise ValueError(f"다운로드 중 {MAX_DOWNLOAD_SIZE_MB}MB 제한 초과")
@@ -535,14 +541,11 @@ def download_notion_file(
 
                 filename = f"{index_tag}_{label}{actual_ext}"
                 destination = asset_dir / filename
-                # 동일한 인덱스/이름의 충돌도 방지합니다.
-                collision = 2
-                while destination.exists():
-                    filename = f"{index_tag}_{label}-{collision}{actual_ext}"
-                    destination = asset_dir / filename
-                    collision += 1
 
+                # 같은 문서를 다시 배포하면 같은 파일명을 재사용해 불필요한 -2, -3 파일을 만들지 않습니다.
+                # temp_path.replace는 기존 목적지 파일을 원자적으로 교체합니다.
                 temp_path.replace(destination)
+                log(f">> [MEDIA] 저장 완료: {destination.as_posix()} ({actual_ext}, {total:,} bytes)")
                 return f"./{quote(asset_dir.name, safe='')}/{quote(filename, safe='')}"
 
             except Exception:
@@ -703,7 +706,10 @@ def render_file_block(
         title = "이미지" if block_type == "image" else f"{block_type.upper()} 파일"
 
     local_path = None
-    if source_type == "file":
+    # Notion 파일 URL(file)뿐 아니라 외부 이미지 URL(external)도 로컬로 내려받습니다.
+    # 특히 image 블록의 PNG/JPG/GIF/WEBP는 가능하면 문서별 _assets 폴더에 보관합니다.
+    downloadable_types = {"image", "file", "pdf", "audio", "video"}
+    if url and source_type in {"file", "external"} and block_type in downloadable_types:
         local_path = download_notion_file(
             url,
             block.get("id", ""),
@@ -987,6 +993,9 @@ def cleanup_unused_assets(asset_dir: Path, markdown_content: str) -> None:
     for asset_path in asset_dir.iterdir():
         if not asset_path.is_file():
             continue
+        # _assets/README.md는 폴더 미리보기 갤러리이므로 일반 미디어 정리 대상에서 제외합니다.
+        if asset_path.name.lower() == "readme.md":
+            continue
         relative = f"./{quote(asset_dir.name, safe='')}/{quote(asset_path.name, safe='')}"
         if relative not in markdown_content:
             try:
@@ -1000,6 +1009,79 @@ def cleanup_unused_assets(asset_dir: Path, markdown_content: str) -> None:
             asset_dir.rmdir()
     except OSError:
         pass
+
+
+IMAGE_ASSET_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".svg"}
+
+
+def natural_asset_sort_key(path: Path) -> Tuple[int, str]:
+    """01_, 02_처럼 번호가 붙은 미디어 파일을 자연스러운 순서로 정렬합니다."""
+    match = re.match(r"^(\d+)_", path.name)
+    return (int(match.group(1)) if match else 10**9, path.name.casefold())
+
+
+def write_asset_gallery(asset_dir: Path) -> int:
+    """_assets 폴더에 GitHub에서 바로 보이는 이미지/GIF 갤러리 README를 생성합니다.
+
+    GitHub 저장소의 폴더 목록은 파일 이름만 나열하므로, README.md를 함께 만들어
+    폴더 화면 하단에 PNG/GIF 미리보기를 렌더링합니다. 각 썸네일 클릭은 Raw 이미지로 연결됩니다.
+    """
+    if not GENERATE_ASSET_GALLERY or not asset_dir.exists():
+        return 0
+
+    image_files = sorted(
+        [p for p in asset_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_ASSET_EXTENSIONS],
+        key=natural_asset_sort_key,
+    )
+    gallery_path = asset_dir / "README.md"
+
+    if not image_files:
+        gallery_path.unlink(missing_ok=True)
+        try:
+            if not any(asset_dir.iterdir()):
+                asset_dir.rmdir()
+        except OSError:
+            pass
+        return 0
+
+    lines = [
+        "# 이미지 및 GIF 미리보기",
+        "",
+        "> 이 폴더에 저장된 이미지 파일의 자동 생성 갤러리입니다.",
+        "> 원본 파일은 각 미리보기를 클릭해 열 수 있습니다.",
+        "",
+    ]
+
+    for image_path in image_files:
+        label = re.sub(r"^\d+_", "", image_path.stem).replace("-", " ").strip() or image_path.stem
+        safe_label = label.replace("[", "\\[").replace("]", "\\]")
+        relative_url = "./" + quote(image_path.name, safe="-._~")
+        # GitHub Actions는 저장소 루트에서 실행되므로 상대 경로를 Raw URL에 사용합니다.
+        # 절대 경로로 테스트하거나 실행하는 경우에도 저장소 루트 기준 경로를 우선 계산합니다.
+        asset_full_path = asset_dir / image_path.name
+        if asset_full_path.is_absolute():
+            try:
+                repo_relative = asset_full_path.resolve().relative_to(Path.cwd().resolve()).as_posix()
+            except ValueError:
+                repo_relative = image_path.name
+        else:
+            repo_relative = asset_full_path.as_posix().lstrip("./")
+        raw_url = (
+            f"{GITHUB_RAW_BASE_URL}/{quote(repo_relative, safe='/-._~')}"
+            if GITHUB_RAW_BASE_URL else relative_url
+        )
+        lines.extend([
+            f"## {safe_label}",
+            "",
+            f"[![{safe_label}]({relative_url})]({raw_url})",
+            "",
+            f"`{image_path.name}`",
+            "",
+        ])
+
+    gallery_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    log(f">> [MEDIA] 이미지 갤러리 생성: {gallery_path.as_posix()} ({len(image_files)}개)")
+    return len(image_files)
 
 
 def save_as_markdown(page: Dict[str, Any], date_str: str) -> Tuple[str, Path]:
@@ -1044,6 +1126,9 @@ def save_as_markdown(page: Dict[str, Any], date_str: str) -> Tuple[str, Path]:
 
     # 반복 배포 시 오래된 파일이 남지 않도록 빈 자산 폴더는 만들지 않습니다.
     cleanup_unused_assets(asset_dir, markdown_content)
+    gallery_count = write_asset_gallery(asset_dir)
+    if gallery_count:
+        log(f">> [INFO] 자산 폴더에 이미지 미리보기가 추가되었습니다: {gallery_count}개")
     filename.write_text(markdown_content.rstrip() + "\n", encoding="utf-8")
 
     return title, filename
