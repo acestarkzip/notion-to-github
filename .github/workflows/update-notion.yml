@@ -33,7 +33,22 @@ jobs:
       - name: Checkout Notion exporter repository
         uses: actions/checkout@v7
         with:
+          # update_readme.py는 Pages 저장소가 아니라 acestarkzip/notion-to-github의 master 루트에서 실행됩니다.
+          ref: master
           fetch-depth: 1
+
+      - name: Confirm exporter version and source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Exporter repository: $(git remote get-url origin)"
+          echo "Exporter branch: $(git branch --show-current)"
+          echo "Exporter commit: $(git rev-parse --short HEAD)"
+          echo "Exporter script: $(pwd)/update_readme.py"
+          grep -n '^EXPORTER_VERSION =' update_readme.py || {
+            echo "::error::업데이트된 update_readme.py가 notion-to-github/master 루트에 없습니다."
+            exit 1
+          }
 
       - name: Set up Python
         uses: actions/setup-python@v7
