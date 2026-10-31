@@ -2,17 +2,22 @@ name: Update Notion Log (Safe Overlay)
 
 on:
   schedule:
-    # 매일 15:05 UTC = 한국 시간 00:05
-    - cron: '5 15 * * *'
+    # 매일 한국 시간 19:00: 오늘(TODAY) 작성된 문서를 동기화합니다.
+    - cron: '0 19 * * *'
+      timezone: 'Asia/Seoul'
+    # 매일 한국 시간 07:00: 전날(YESTERDAY) 작성된 문서를 다시 동기화합니다.
+    - cron: '0 7 * * *'
+      timezone: 'Asia/Seoul'
   workflow_dispatch:
     inputs:
       fetch_mode:
-        description: '수동 실행 시 조회 범위 (ALL은 전체 Notion 기록, DAILY는 전날 기록만)'
+        description: '수동 실행 조회 범위: ALL(전체), Yesterday(어제), Today(오늘)'
         required: true
         type: choice
         options:
           - ALL
-          - DAILY
+          - Yesterday
+          - Today
         default: ALL
 
 # 이 workflow는 현재 저장소를 읽고, Pages 저장소는 SSH Deploy Key로 업데이트합니다.
@@ -58,12 +63,49 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --upgrade pip requests
 
-      # 예약 실행은 DAILY, 수동 실행은 기본 ALL (실행 화면에서 선택 가능)
+      # 예약 시간에 따라 조회 날짜를 명시적으로 결정합니다.
+      # 19:00 KST 실행은 TODAY, 다음 날 07:00 KST 실행은 YESTERDAY입니다.
+      # 수동 실행에서는 ALL / Yesterday / Today 선택값을 사용합니다.
+      - name: Resolve fetch mode (KST schedule and manual choice)
+        id: fetch-mode
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE_CRON: ${{ github.event.schedule }}
+          INPUT_FETCH_MODE: ${{ inputs.fetch_mode }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            case "$SCHEDULE_CRON" in
+              '0 19 * * *') FETCH_MODE="TODAY" ;;
+              '0 7 * * *') FETCH_MODE="YESTERDAY" ;;
+              *)
+                echo "::error::알 수 없는 예약 cron입니다: $SCHEDULE_CRON"
+                exit 1
+                ;;
+            esac
+          else
+            case "${INPUT_FETCH_MODE,,}" in
+              all) FETCH_MODE="ALL" ;;
+              yesterday) FETCH_MODE="YESTERDAY" ;;
+              today) FETCH_MODE="TODAY" ;;
+              *)
+                echo "::error::잘못된 수동 조회 범위입니다: $INPUT_FETCH_MODE"
+                exit 1
+                ;;
+            esac
+          fi
+
+          echo "FETCH_MODE=$FETCH_MODE" >> "$GITHUB_ENV"
+          echo "fetch_mode=$FETCH_MODE" >> "$GITHUB_OUTPUT"
+          echo ">> 선택된 조회 범위: $FETCH_MODE (KST)"
+
       - name: Run Notion exporter
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-          FETCH_MODE: ${{ github.event_name == 'schedule' && 'DAILY' || inputs.fetch_mode || 'ALL' }}
+          FETCH_MODE: ${{ steps.fetch-mode.outputs.fetch_mode }}
           RESET_MODE: 'false'
           GITHUB_RAW_BASE_URL: https://raw.githubusercontent.com/acestarkzip/acestarkzip.github.io/main
         run: python update_readme.py
