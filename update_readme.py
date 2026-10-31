@@ -4,32 +4,31 @@ import re
 from datetime import datetime, timezone, timedelta
 
 # =======================================================
-# [ 설정 ]
+# [설정 영역]
 # =======================================================
 
 SAVE_DIR_ROOT = "TIL" 
-NOTION_PROPERTY_TITLE = "제목"  # 사용 중인 노션 제목 속성명에 맞게 변경해 주세요
-NOTION_PROPERTY_DATE = "날짜"    # 사용 중인 노션 날짜 속성명에 맞게 변경해 주세요
+NOTION_PROPERTY_TITLE = "제목"
+NOTION_PROPERTY_DATE = "날짜"
 README_FILE = "README.md"
-MARKER_START = "<!-- START_SECTION:til -->"
-MARKER_END = "<!-- END_SECTION:til -->"
+MARKER_START = "<!-- START_TIL -->"
+MARKER_END = "<!-- END_TIL -->"
 TIMEZONE_HOURS = 9 
 
-# 기본 README 템플릿
 DEFAULT_README_TEMPLATE = f"""# 📚 My TIL Collection
 
-매일 학습한 TIL(Today I Learned) 기록입니다.
+노션(Today I Learned) 자동화 수집 공간입니다.
 
-## 최근 기록
+## 📌 최근 학습 목록
 {MARKER_START}
 {MARKER_END}
 """
 
 # =======================================================
-# [ 환경변수 및 헤더 ]
+# [인증 및 헤더]
 # =======================================================
-NOTION_TOKEN = os.environ['NOTION_TOKEN']
-DATABASE_ID = os.environ['NOTION_DATABASE_ID']
+NOTION_TOKEN = os.environ.get('NOTION_TOKEN', '')
+DATABASE_ID = os.environ.get('NOTION_DATABASE_ID', '')
 
 headers = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -39,25 +38,53 @@ headers = {
 
 def get_page_blocks(block_id):
     """
-    특정 페이지 또는 블록의 자식 블록들을 재귀적으로 가져옵니다.
+    특정 페이지 또는 블록의 자식 블록들을 재귀적으로 가져오며,
+    column_list 등 중첩된 레이아웃 내부의 블록까지 탐색합니다.
     """
-    url = f"https://api.notion.com/v1/blocks/{block_id}/children"
+    url = f"https://api.com/v1/blocks/{block_id}/children" if False else f"https://api.notion.com/v1/blocks/{block_id}/children"
     response = requests.get(url, headers=headers)
     results = response.json().get('results', [])
     
     blocks = []
     for block in results:
-        # 자식 블록이 존재할 경우 재귀적으로 탐색
-        if block.get('has_children'):
+        b_type = block.get('type')
+        # 열(Column) 레이아웃이나 토글 등 내부 자식을 가진 블록 처리
+        if block.get('has_children') or b_type in ['column_list', 'column', 'toggle']:
             block['children'] = get_page_blocks(block['id'])
         blocks.append(block)
     return blocks
 
 def extract_text_from_rich_text(rich_text_list):
+    """
+    노션 텍스트 색상(color) 및 스타일(annotation)을 반영하여 마크다운/HTML로 변환합니다.
+    """
     content = ""
     for text in rich_text_list:
-        plain = text['plain_text']
+        plain = text.get('plain_text', '')
         href = text.get('href')
+        annotations = text.get('annotations', {})
+        
+        # 스타일 적용 (굵기, 기울임, 밑줄 등)
+        if annotations.get('bold'):
+            plain = f"**{plain}**"
+        if annotations.get('italic'):
+            plain = f"*{plain}*"
+        if annotations.get('strikethrough'):
+            plain = f"~~{plain}~~"
+        if annotations.get('code'):
+            plain = f"`{plain}`"
+            
+        # 노션 글자 색상 및 배경색 처리 (color가 default가 아닌 경우)
+        color = annotations.get('color', 'default')
+        if color != 'default':
+            if '_background' in color:
+                # 배경색 처리 (예: gray_background -> background-color)
+                bg_color = color.replace('_background', '')
+                plain = f"<mark style='background-color: {bg_color};'>{plain}</mark>"
+            else:
+                # 글자 색상 처리
+                plain = f"<span style='color: {color};'>{plain}</span>"
+
         if href:
             content += f"[{plain}]({href})"
         else:
@@ -65,15 +92,11 @@ def extract_text_from_rich_text(rich_text_list):
     return content
 
 def block_to_markdown(block, depth=0):
-    """
-    depth 인자를 받아 하위 계층일수록 들여쓰기 공백을 추가하여
-    GitHub Markdown 프리뷰에서 깨지지 않는 리스트를 생성합니다.
-    """
     b_type = block['type']
-    indent = "  " * depth  # 깊이에 따른 2칸 들여쓰기
+    indent = "  " * depth  
     markdown_output = ""
 
-    if b_type in ['paragraph', 'heading_1', 'heading_2', 'heading_3', 'bulleted_list_item', 'numbered_list_item', 'to_do', 'toggle', 'quote', 'callout']:
+    if b_type in ['paragraph', 'heading_1', 'heading_2', 'heading_3', 'bulleted_list_item', 'numbered_list_item', 'to_do', 'toggle']:
         rich_text = block[b_type].get('rich_text', [])
         content = extract_text_from_rich_text(rich_text)
         
@@ -93,28 +116,60 @@ def block_to_markdown(block, depth=0):
         elif b_type == 'to_do':
             checked = "[x]" if block['to_do']['checked'] else "[ ]"
             markdown_output += f"{indent}- {checked} {content}\n"
-        elif b_type == 'quote': 
-            markdown_output += f"{indent}> {content}\n\n"
-        elif b_type == 'callout': 
-            markdown_output += f"{indent}> 💡 {content}\n\n"
         elif b_type == 'toggle': 
-            markdown_output += f"{indent}- {content}\n"
+            markdown_output += f"{indent}- 📂 {content}\n"
             
+    elif b_type == 'quote':
+        rich_text = block['quote'].get('rich_text', [])
+        content = extract_text_from_rich_text(rich_text)
+        markdown_output += f"{indent}> {content}\n\n"
+        
+    elif b_type == 'callout':
+        rich_text = block['callout'].get('rich_text', [])
+        content = extract_text_from_rich_text(rich_text)
+        icon = block['callout'].get('icon', {})
+        icon_emoji = icon.get('emoji', '💡') if icon.get('type') == 'emoji' else '💡'
+        # GitHub Preview에서 눈에 띄는 콜아웃 박스 형태로 변환
+        markdown_output += f"\n> {icon_emoji} **{content}**\n\n"
+        
     elif b_type == 'code':
         language = block['code'].get('language', 'text')
         rich_text = block['code'].get('rich_text', [])
         content = extract_text_from_rich_text(rich_text)
         markdown_output += f"{indent}```{language}\n{content}\n{indent}```\n\n"
+        
     elif b_type == 'image':
-        url = block['image'].get('file', {}).get('url') or block['image'].get('external', {}).get('url') or ""
+        image_info = block['image']
+        url = image_info.get('file', {}).get('url') or image_info.get('external', {}).get('url') or ""
         markdown_output += f"{indent}![Image]({url})\n\n"
+        
+    elif b_type in ['video', 'embed']:
+        # 비디오 및 임베드 링크 처리
+        v_info = block.get(b_type, {})
+        url = v_info.get('url', '')
+        markdown_output += f"{indent}🎥 [Watch Video / Embed]({url})\n\n"
+        
+    elif b_type == 'bookmark':
+        # 북마크 링크 처리
+        b_info = block.get('bookmark', {})
+        url = b_info.get('url', '')
+        caption_text = extract_text_from_rich_text(b_info.get('caption', []))
+        display_text = caption_text if caption_text else url
+        markdown_output += f"{indent}🔗 [{display_text}]({url})\n\n"
+        
+    elif b_type == 'pdf':
+        # PDF 파일 처리
+        pdf_info = block.get('pdf', {})
+        url = pdf_info.get('file', {}).get('url') or pdf_info.get('external', {}).get('url') or ""
+        markdown_output += f"{indent}📄 [View PDF Document]({url})\n\n"
+        
     elif b_type == 'divider': 
         markdown_output += f"\n---\n\n"
 
-    # 자식 블록이 있으면 depth + 1을 전달하여 처리
+    # 중첩된 자식 블록(Column 레이아웃, 토글 내용 등) 재귀 처리
     if block.get('children'):
         for child in block['children']:
-            markdown_output += block_to_markdown(child, depth + 1)
+            markdown_output += block_to_markdown(child, depth + (1 if b_type in ['column', 'toggle'] else 0))
 
     return markdown_output
 
@@ -133,7 +188,12 @@ def save_as_markdown(page, date_str):
     except:
         title = "Untitled"
     
-    date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+    try:
+        date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+    except:
+        date_obj = datetime.now()
+        date_str = date_obj.strftime("%Y-%m-%d")
+        
     year = date_obj.strftime("%Y")
     month = date_obj.strftime("%m")
     
@@ -150,7 +210,7 @@ def save_as_markdown(page, date_str):
     markdown_content += "---\n\n"
     
     for block in blocks:
-        markdown_content += block_to_markdown(block, depth=0)
+        markdown_content += block_to_markdown(block)
     
     with open(filename, "w", encoding="utf-8") as f:
         f.write(markdown_content)
@@ -206,7 +266,6 @@ def update_main_readme_by_scanning(reset_mode):
             new_content += "\n</details>\n\n"
 
     if reset_mode == 'true' or not os.path.exists(README_FILE):
-        print(f">> [INFO] README.md 생성. (RESET_MODE: {reset_mode})")
         with open(README_FILE, "w", encoding="utf-8") as f:
             f.write(DEFAULT_README_TEMPLATE)
 
@@ -230,17 +289,17 @@ def update_main_readme_by_scanning(reset_mode):
 
 def main():
     fetch_mode = os.environ.get('FETCH_MODE', 'DAILY')
-    reset_mode = os.environ.get('RESET_MODE', 'false').lower()
+    reset_mode = os.environ.get('RESET_MODE', 'false').lower() 
     
     url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
     payload = {}
 
     if fetch_mode == "ALL":
-        print(">> [모드: ALL] 전체 데이터를 가져옵니다.")
+        print(">> [INFO] 전체 데이터 동기화 시작")
     else:
         kst = timezone(timedelta(hours=TIMEZONE_HOURS))
         target_date = (datetime.now(kst) - timedelta(days=1)).strftime("%Y-%m-%d")
-        print(f">> [모드: DAILY] {target_date} 데이터를 가져옵니다.")
+        print(f">> [INFO] 대상 날짜: {target_date}")
         payload["filter"] = {
             "property": NOTION_PROPERTY_DATE,
             "date": { "equals": target_date }
@@ -267,7 +326,7 @@ def main():
                 continue
 
             title, filepath = save_as_markdown(page, page_date)
-            print(f"DEBUG: 변환 완료 - {page_date} : {title}")
+            print(f"DEBUG: 성공 - {page_date} : {title}")
         
         has_more = data.get('has_more', False)
         next_cursor = data.get('next_cursor')
