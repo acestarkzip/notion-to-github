@@ -599,11 +599,11 @@ def youtube_markdown(url: str, title: str = "YouTube 영상") -> str:
 # =======================================================
 
 def collect_headings(blocks: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """본문의 heading_1~3을 문서 순서대로 찾아 사용자 지정 앵커와 함께 반환합니다."""
+    """본문의 heading_1~6을 문서 순서대로 찾아 사용자 지정 앵커와 함께 반환합니다."""
     headings: List[Dict[str, Any]] = []
     for block in blocks:
         block_type = block.get("type")
-        if block_type in {"heading_1", "heading_2", "heading_3"}:
+        if block_type in {"heading_1", "heading_2", "heading_3", "heading_4", "heading_5", "heading_6"}:
             content = plain_text(get_block_rich_text(block)).strip()
             if content:
                 headings.append({
@@ -682,6 +682,19 @@ def github_raw_url_for_asset(asset_dir: Path, local_markdown_path: str) -> Optio
     return f"{GITHUB_RAW_BASE_URL}/{encoded_path}"
 
 
+def nearest_heading_label(heading_stack: List[Tuple[int, str]], fallback: str = "") -> str:
+    """가장 가까운(가장 낮은 레벨의) 유효한 제목을 미디어 파일명으로 사용합니다.
+
+    heading_stack은 (레벨, 제목)을 H1 -> H6 순서로 보관합니다.
+    현재 레벨의 제목이 비어 있으면 상위 레벨의 마지막 유효 제목으로 돌아갑니다.
+    """
+    for _level, heading_title in reversed(heading_stack):
+        normalized = str(heading_title or "").strip()
+        if normalized:
+            return normalized
+    return str(fallback or "").strip() or "image"
+
+
 def render_file_block(
     block: Dict[str, Any],
     block_type: str,
@@ -694,9 +707,12 @@ def render_file_block(
     caption = get_caption(data)
     original_name = str(data.get("name") or "").strip()
 
-    # Notion의 기본 파일명(예: IMAGE 파일)은 설명력이 낮으므로
-    # 캡션이 없으면 현재 위치의 가장 가까운 제목을 사용합니다.
-    if caption:
+    # 이미지 파일명은 현재 위치에서 가장 가까운(가장 낮은 레벨의) Heading을 우선합니다.
+    # Heading이 비어 있거나 아직 등장하지 않았다면 상위 Heading 또는 페이지 제목을 사용합니다.
+    # 단, alt text에는 아래에서 Notion 캡션을 계속 우선 적용합니다.
+    if block_type == "image" and context_label:
+        title = context_label
+    elif caption:
         title = caption
     elif original_name and not is_generic_asset_name(original_name):
         title = original_name
@@ -788,12 +804,15 @@ def render_blocks(
     toc_markdown: str = "",
     asset_counter: Optional[List[int]] = None,
     asset_context: Optional[List[str]] = None,
+    heading_stack: Optional[List[Tuple[int, str]]] = None,
 ) -> str:
-    # Shared counter/context across nested blocks keeps asset names unique and meaningful.
+    # asset_counter is shared across nested blocks; heading_stack is copied for child scopes.
     if asset_counter is None:
         asset_counter = [0]
     if asset_context is None:
         asset_context = [""]
+    if heading_stack is None:
+        heading_stack = []
     output: List[str] = []
     indent_text = " " * indent
     list_block_types = {"bulleted_list_item", "numbered_list_item", "to_do"}
@@ -815,9 +834,9 @@ def render_blocks(
 
         data = block.get(block_type, {}) or {}
         rich = data.get("rich_text", []) or []
-        # 제목은 # / ## / ### 자체로 시각적 강조가 적용되므로,
+        # 제목은 #~###### 자체로 시각적 강조가 적용되므로,
         # Notion의 굵게 서식까지 **로 중복 변환하지 않습니다.
-        is_heading = block_type in {"heading_1", "heading_2", "heading_3"}
+        is_heading = block_type in {"heading_1", "heading_2", "heading_3", "heading_4", "heading_5", "heading_6"}
         content = rich_text_to_markdown(rich, preserve_bold=not is_heading)
         children = block.get("_children", []) or []
 
@@ -825,13 +844,20 @@ def render_blocks(
             if content.strip():
                 output.append(f"{indent_text}{content}\n\n")
             elif children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, asset_context))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
 
-        elif block_type in {"heading_1", "heading_2", "heading_3"}:
+        elif block_type in {"heading_1", "heading_2", "heading_3", "heading_4", "heading_5", "heading_6"}:
             level = int(block_type[-1])
             plain_heading = plain_text(rich).strip()
+
+            # 새 제목이 시작되면 같은 레벨 및 더 낮은(숫자가 큰) 하위 제목을 제거합니다.
+            # 예: H1 > H2 > H3 다음에 새 H2가 오면 이전 H3는 더 이상 현재 문맥이 아닙니다.
+            while heading_stack and heading_stack[-1][0] >= level:
+                heading_stack.pop()
             if plain_heading:
+                heading_stack.append((level, plain_heading))
                 asset_context[0] = plain_heading
+
             # Notion 목차 블록이 있는 문서에서는 제목 바로 앞에 고유한 HTML anchor를
             # 직접 삽입합니다. 링크가 GitHub의 자동 slug 규칙에 의존하지 않게 합니다.
             if toc_markdown:
@@ -839,28 +865,28 @@ def render_blocks(
                 output.append(f'<a name="{anchor}"></a>\n\n')
             output.append(f"{indent_text}{'#' * level} {content}\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, asset_context))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
 
         elif block_type == "bulleted_list_item":
             output.append(f"{indent_text}- {content}\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent + 2, toc_markdown, asset_counter, asset_context))
+                output.append(render_blocks(children, asset_dir, indent + 2, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
 
         elif block_type == "numbered_list_item":
             output.append(f"{indent_text}1. {content}\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent + 3, toc_markdown, asset_counter, asset_context))
+                output.append(render_blocks(children, asset_dir, indent + 3, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
 
         elif block_type == "to_do":
             checked = "x" if data.get("checked") else " "
             output.append(f"{indent_text}- [{checked}] {content}\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent + 2, toc_markdown, asset_counter, asset_context))
+                output.append(render_blocks(children, asset_dir, indent + 2, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
 
         elif block_type == "toggle":
             output.append(f"{indent_text}<details>\n{indent_text}<summary>{content or '자세히 보기'}</summary>\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, asset_context))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
             output.append(f"{indent_text}</details>\n\n")
 
         elif block_type == "quote":
@@ -873,7 +899,7 @@ def render_blocks(
             quote_lines = (content or " ").splitlines() or [" "]
             output.append("\n".join(f"{indent_text}> {icon} {line}" for line in quote_lines) + "\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, asset_context))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
 
         elif block_type == "code":
             # GitHub applies syntax highlighting based on this language identifier.
@@ -884,13 +910,15 @@ def render_blocks(
         elif block_type == "image":
             asset_counter[0] += 1
             output.append(render_file_block(
-                block, "image", asset_dir, asset_counter[0], context_label=asset_context[0]
+                block, "image", asset_dir, asset_counter[0],
+                context_label=nearest_heading_label(heading_stack, asset_context[0])
             ))
 
         elif block_type in {"file", "pdf", "audio", "video"}:
             asset_counter[0] += 1
             output.append(render_file_block(
-                block, block_type, asset_dir, asset_counter[0], context_label=asset_context[0]
+                block, block_type, asset_dir, asset_counter[0],
+                context_label=nearest_heading_label(heading_stack, asset_context[0])
             ))
 
         elif block_type == "embed":
@@ -923,7 +951,7 @@ def render_blocks(
 
         elif block_type in {"column_list", "column", "synced_block"}:
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, asset_context))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
                 if block_type in {"column", "column_list"}:
                     output.append("\n")
 
@@ -937,7 +965,7 @@ def render_blocks(
             child_url = f"https://www.notion.so/{block.get('id', '').replace('-', '')}"
             output.append(f"[📄 {child_title}]({child_url})\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, asset_context))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
 
         elif block_type == "child_database":
             db_title = data.get("title", "하위 데이터베이스")
@@ -964,13 +992,13 @@ def render_blocks(
             if content:
                 output.append(f"{indent_text}{content}\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, asset_context))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
 
         else:
             # 알 수 없는 블록이라도 완전히 조용히 버리지 않고 유형을 기록합니다.
             output.append(f"<!-- Notion block type not yet converted: {block_type or 'unknown'} -->\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, asset_context))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
 
         previous_was_list = is_list_block
 
@@ -1109,7 +1137,7 @@ def save_as_markdown(page: Dict[str, Any], date_str: str) -> Tuple[str, Path]:
         toc_markdown = build_table_of_contents(headings)
         log(f">> [INFO] Notion 목차 블록 감지: GitHub 링크 {len(headings)}개 생성")
         if not headings:
-            log(">> [WARN] 목차 블록은 있지만 H1~H3 제목을 찾지 못했습니다.")
+            log(">> [WARN] 목차 블록은 있지만 H1~H6 제목을 찾지 못했습니다.")
     else:
         log(">> [INFO] Notion 목차 블록이 없어 GitHub 목차를 추가하지 않습니다.")
 
@@ -1122,6 +1150,7 @@ def save_as_markdown(page: Dict[str, Any], date_str: str) -> Tuple[str, Path]:
         asset_dir,
         toc_markdown=toc_markdown,
         asset_context=[title],
+        heading_stack=[],
     )
 
     # 반복 배포 시 오래된 파일이 남지 않도록 빈 자산 폴더는 만들지 않습니다.
