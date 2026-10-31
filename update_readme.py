@@ -182,8 +182,15 @@ def plain_text(rich_text_list: Optional[List[Dict[str, Any]]]) -> str:
     return "".join(parts)
 
 
-def rich_text_to_markdown(rich_text_list: Optional[List[Dict[str, Any]]]) -> str:
-    """굵게/기울임/취소선/밑줄/인라인 코드/하이퍼링크를 Markdown으로 변환합니다."""
+def rich_text_to_markdown(
+    rich_text_list: Optional[List[Dict[str, Any]]],
+    preserve_bold: bool = True,
+) -> str:
+    """Notion rich text를 Markdown으로 변환합니다.
+
+    preserve_bold=False이면 제목 블록처럼 Markdown 자체가 강조를 제공하는 곳에서
+    중복 ** 표시를 만들지 않습니다. 일반 문단에서는 기본값(True)으로 굵게를 유지합니다.
+    """
     output: List[str] = []
 
     for item in rich_text_list or []:
@@ -208,7 +215,7 @@ def rich_text_to_markdown(rich_text_list: Optional[List[Dict[str, Any]]]) -> str
             value = f"{fence}{value}{fence}"
         else:
             value = text_value
-            if annotations.get("bold"):
+            if preserve_bold and annotations.get("bold"):
                 value = f"**{value}**"
             if annotations.get("italic"):
                 value = f"*{value}*"
@@ -571,7 +578,10 @@ def render_blocks(
         block_type = block.get("type", "")
         data = block.get(block_type, {}) or {}
         rich = data.get("rich_text", []) or []
-        content = rich_text_to_markdown(rich)
+        # 제목은 # / ## / ### 자체로 시각적 강조가 적용되므로,
+        # Notion의 굵게 서식까지 **로 중복 변환하지 않습니다.
+        is_heading = block_type in {"heading_1", "heading_2", "heading_3"}
+        content = rich_text_to_markdown(rich, preserve_bold=not is_heading)
         children = block.get("_children", []) or []
 
         if block_type == "paragraph":
