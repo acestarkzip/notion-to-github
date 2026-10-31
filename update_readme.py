@@ -5,7 +5,7 @@ Required environment variables:
     NOTION_DATABASE_ID    Database ID containing TIL pages
 
 Optional environment variables:
-    FETCH_MODE            DAILY (default) or ALL
+    FETCH_MODE            ALL, TODAY, or YESTERDAY (default YESTERDAY; DAILY is a legacy alias)
     RESET_MODE            true / false (default false)
     GITHUB_RAW_BASE_URL   Raw URL base for the destination repository (optional)
 
@@ -32,7 +32,7 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.01-heading-asset-fix-01"
+EXPORTER_VERSION = "2026.11.01-kst-twice-daily-fetch-modes-01"
 
 SAVE_DIR_ROOT = Path("TIL")
 NOTION_PROPERTY_TITLE = "제목"
@@ -1288,16 +1288,52 @@ def update_main_readme_by_scanning(reset_mode: str) -> None:
 # [데이터베이스 조회 및 실행]
 # =======================================================
 
+def target_date_for_fetch_mode(
+    fetch_mode: str,
+    now_kst: Optional[datetime] = None,
+) -> Optional[str]:
+    """ALL/TODAY/YESTERDAY 조회 모드에 해당하는 Notion 날짜를 반환합니다.
+
+    now_kst는 테스트용으로 주입할 수 있습니다. 시간대가 없는 datetime은 KST로 간주합니다.
+    과거 Workflow 호환성을 위해 DAILY는 YESTERDAY의 별칭으로 처리합니다.
+    """
+    mode = str(fetch_mode or "").strip().upper()
+    if mode == "DAILY":
+        mode = "YESTERDAY"
+
+    if mode == "ALL":
+        return None
+    if mode not in {"TODAY", "YESTERDAY"}:
+        raise ValueError(
+            f"지원하지 않는 FETCH_MODE={fetch_mode!r}. ALL, TODAY, YESTERDAY를 사용하세요."
+        )
+
+    kst = timezone(timedelta(hours=TIMEZONE_HOURS))
+    current = now_kst or datetime.now(kst)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=kst)
+    else:
+        current = current.astimezone(kst)
+
+    target = current.date()
+    if mode == "YESTERDAY":
+        target -= timedelta(days=1)
+    return target.strftime("%Y-%m-%d")
+
+
 def query_database(fetch_mode: str) -> List[Dict[str, Any]]:
     url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
     payload: Dict[str, Any] = {"page_size": 100}
+    mode = str(fetch_mode or "").strip().upper()
+    if mode == "DAILY":
+        mode = "YESTERDAY"
 
-    if fetch_mode.upper() == "ALL":
-        log(">> [모드: 전체] 모든 데이터를 조회합니다.")
+    target_date = target_date_for_fetch_mode(mode)
+    if target_date is None:
+        log(">> [모드: ALL] 모든 Notion 기록을 조회합니다.")
     else:
-        kst = timezone(timedelta(hours=TIMEZONE_HOURS))
-        target_date = (datetime.now(kst) - timedelta(days=1)).strftime("%Y-%m-%d")
-        log(f">> [모드: 일간] {target_date} 데이터를 조회합니다.")
+        label = "오늘" if mode == "TODAY" else "어제"
+        log(f">> [모드: {mode}] {label} 날짜인 {target_date}의 Notion 기록을 조회합니다.")
         payload["filter"] = {
             "property": NOTION_PROPERTY_DATE,
             "date": {"equals": target_date},
@@ -1325,12 +1361,16 @@ def main() -> None:
     if not DATABASE_ID:
         raise SystemExit("[ERROR] GitHub Secrets에 NOTION_DATABASE_ID가 설정되어 있는지 확인하세요.")
 
-    fetch_mode = os.environ.get("FETCH_MODE", "DAILY").upper()
+    fetch_mode = os.environ.get("FETCH_MODE", "YESTERDAY").strip().upper()
     reset_mode = os.environ.get("RESET_MODE", "false").lower()
 
-    if fetch_mode not in {"DAILY", "ALL"}:
-        log(f">> [WARN] 알 수 없는 FETCH_MODE={fetch_mode}. DAILY 모드로 실행합니다.")
-        fetch_mode = "DAILY"
+    # 기존 DAILY 값은 호환성을 위해 YESTERDAY로 해석합니다.
+    if fetch_mode == "DAILY":
+        fetch_mode = "YESTERDAY"
+    if fetch_mode not in {"ALL", "TODAY", "YESTERDAY"}:
+        raise SystemExit(
+            f"[ERROR] 잘못된 FETCH_MODE={fetch_mode!r}. ALL, TODAY, YESTERDAY 중 하나를 사용하세요."
+        )
 
     pages = query_database(fetch_mode)
     log(f">> [INFO] 조회된 Notion 페이지: {len(pages)}개")
