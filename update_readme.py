@@ -14,6 +14,7 @@ so that the existing /v1/databases/{id}/query workflow remains compatible.
 
 from __future__ import annotations
 
+import hashlib
 import mimetypes
 import os
 import re
@@ -182,6 +183,37 @@ def plain_text(rich_text_list: Optional[List[Dict[str, Any]]]) -> str:
     return "".join(parts)
 
 
+def inline_code_span(text: str) -> str:
+    """Render a Notion inline-code annotation as a Markdown code span."""
+    longest = max((len(match.group(0)) for match in re.finditer(r"`+", text)), default=0)
+    delimiter = "`" * (longest + 1)
+    needs_padding = (
+        text.startswith("`") or text.endswith("`")
+        or text.startswith(" ") or text.endswith(" ")
+    )
+    padding = " " if needs_padding else ""
+    return f"{delimiter}{padding}{text}{padding}{delimiter}"
+
+
+GITHUB_LANGUAGE_ALIASES = {
+    "plain text": "text", "plaintext": "text", "shell": "bash",
+    "sh": "bash", "zsh": "bash", "c++": "cpp", "c#": "csharp",
+    "f#": "fsharp", "objective-c": "objectivec", "visual basic": "vb",
+    "vb.net": "vbnet", "docker": "dockerfile", "yml": "yaml",
+    "js": "javascript", "ts": "typescript", "py": "python",
+    "ps1": "powershell", "pwsh": "powershell", "md": "markdown",
+    "html5": "html", "jsonc": "json",
+}
+
+
+def normalize_github_language(language: Optional[str]) -> str:
+    """Map Notion language labels to GitHub-compatible code-fence hints."""
+    value = re.sub(r"\s+", " ", str(language or "").strip().lower())
+    if not value:
+        return "text"
+    return GITHUB_LANGUAGE_ALIASES.get(value, value.replace(" ", ""))
+
+
 def rich_text_to_markdown(
     rich_text_list: Optional[List[Dict[str, Any]]],
     preserve_bold: bool = True,
@@ -209,10 +241,8 @@ def rich_text_to_markdown(
 
         annotations = item.get("annotations", {}) or {}
         if annotations.get("code"):
-            value = text_value.replace("`", "\\`")
-            longest = max((len(match.group(0)) for match in re.finditer(r"`+", value)), default=0)
-            fence = "`" * (longest + 1)
-            value = f"{fence}{value}{fence}"
+            # Inline code must stay inline; fenced blocks are reserved for Notion code blocks.
+            value = inline_code_span(text_value)
         else:
             value = text_value
             if preserve_bold and annotations.get("bold"):
@@ -338,6 +368,7 @@ def download_notion_file(
     block_id: str,
     asset_dir: Path,
     preferred_name: str = "",
+    asset_index: int = 0,
 ) -> Optional[str]:
     """Notion이 발급한 임시 파일 URL을 저장하고 Markdown 상대 경로를 반환합니다."""
     if not DOWNLOAD_NOTION_FILES or not url:
@@ -346,7 +377,13 @@ def download_notion_file(
         return None
 
     asset_dir.mkdir(parents=True, exist_ok=True)
-    safe_id = re.sub(r"[^a-zA-Z0-9]", "", block_id)[:10] or "asset"
+    # Use the full block ID plus a stable URL-path fingerprint and page-order index.
+    # This prevents different Notion images from overwriting one another.
+    safe_id = re.sub(r"[^a-zA-Z0-9]", "", block_id)[:32] or "asset"
+    parsed_url = urlparse(url)
+    stable_url_identity = f"{parsed_url.netloc.lower()}{unquote(parsed_url.path)}"
+    url_fingerprint = hashlib.sha256(stable_url_identity.encode("utf-8")).hexdigest()[:10]
+    index_tag = f"{max(0, int(asset_index)):04d}"
 
     try:
         with SESSION.get(url, stream=True, timeout=REQUEST_TIMEOUT_SECONDS) as response:
@@ -362,7 +399,7 @@ def download_notion_file(
             if Path(base_name).suffix:
                 extension = Path(base_name).suffix
                 base_name = Path(base_name).stem
-            filename = f"{safe_id}_{base_name}{extension}"
+            filename = f"{safe_id}_{index_tag}_{url_fingerprint}_{base_name}{extension}"
             destination = asset_dir / filename
 
             total = 0
@@ -380,7 +417,7 @@ def download_notion_file(
                 destination.unlink(missing_ok=True)
                 raise
 
-            return f"./{asset_dir.name}/{quote(filename)}"
+            return f"./{quote(asset_dir.name)}/{quote(filename)}"
 
     except (requests.RequestException, OSError, ValueError) as exc:
         log(f">> [WARN] 파일 다운로드 실패. 원본 링크를 사용합니다: {exc}")
@@ -503,6 +540,7 @@ def render_file_block(
     block: Dict[str, Any],
     block_type: str,
     asset_dir: Path,
+    asset_index: int = 0,
 ) -> str:
     data = block.get(block_type, {}) or {}
     url, source_type = get_media_source(data)
@@ -511,7 +549,9 @@ def render_file_block(
 
     local_path = None
     if source_type == "file":
-        local_path = download_notion_file(url, block.get("id", ""), asset_dir, title)
+        local_path = download_notion_file(
+            url, block.get("id", ""), asset_dir, title, asset_index=asset_index
+        )
 
     target = local_path or url
     if not target:
@@ -570,12 +610,30 @@ def render_blocks(
     asset_dir: Path,
     indent: int = 0,
     toc_markdown: str = "",
+    asset_counter: Optional[List[int]] = None,
 ) -> str:
+    # Shared counter across nested blocks gives every media block a unique index.
+    if asset_counter is None:
+        asset_counter = [0]
     output: List[str] = []
     indent_text = " " * indent
+    list_block_types = {"bulleted_list_item", "numbered_list_item", "to_do"}
+    previous_was_list = False
 
     for block in blocks:
         block_type = block.get("type", "")
+        # Notion may return structural blocks that do not render as standalone content.
+        if block_type in {"breadcrumb", "table_row"}:
+            continue
+
+        is_list_block = block_type in list_block_types
+        # A Markdown list must be separated from the following paragraph, heading,
+        # table, quote, etc. by a blank line. Without it GitHub may treat that next
+        # block as part of the final list item (which caused the section 8 text to
+        # appear on the same line as the previous bullet in Preview).
+        if previous_was_list and not is_list_block:
+            output.append("\n")
+
         data = block.get(block_type, {}) or {}
         rich = data.get("rich_text", []) or []
         # 제목은 # / ## / ### 자체로 시각적 강조가 적용되므로,
@@ -588,35 +646,35 @@ def render_blocks(
             if content.strip():
                 output.append(f"{indent_text}{content}\n\n")
             elif children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter))
 
         elif block_type in {"heading_1", "heading_2", "heading_3"}:
             level = int(block_type[-1])
             # GitHub가 Markdown 제목에서 자동 생성하는 anchor를 사용합니다.
             output.append(f"{indent_text}{'#' * level} {content}\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter))
 
         elif block_type == "bulleted_list_item":
             output.append(f"{indent_text}- {content}\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent + 2, toc_markdown))
+                output.append(render_blocks(children, asset_dir, indent + 2, toc_markdown, asset_counter))
 
         elif block_type == "numbered_list_item":
             output.append(f"{indent_text}1. {content}\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent + 3, toc_markdown))
+                output.append(render_blocks(children, asset_dir, indent + 3, toc_markdown, asset_counter))
 
         elif block_type == "to_do":
             checked = "x" if data.get("checked") else " "
             output.append(f"{indent_text}- [{checked}] {content}\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent + 2, toc_markdown))
+                output.append(render_blocks(children, asset_dir, indent + 2, toc_markdown, asset_counter))
 
         elif block_type == "toggle":
             output.append(f"{indent_text}<details>\n{indent_text}<summary>{content or '자세히 보기'}</summary>\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter))
             output.append(f"{indent_text}</details>\n\n")
 
         elif block_type == "quote":
@@ -629,18 +687,21 @@ def render_blocks(
             quote_lines = (content or " ").splitlines() or [" "]
             output.append("\n".join(f"{indent_text}> {icon} {line}" for line in quote_lines) + "\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter))
 
         elif block_type == "code":
-            language = data.get("language", "text")
+            # GitHub applies syntax highlighting based on this language identifier.
+            language = normalize_github_language(data.get("language", "text"))
             code_content = plain_text(data.get("rich_text", []))
             output.append(fenced_code(language, code_content))
 
         elif block_type == "image":
-            output.append(render_file_block(block, "image", asset_dir))
+            asset_counter[0] += 1
+            output.append(render_file_block(block, "image", asset_dir, asset_counter[0]))
 
         elif block_type in {"file", "pdf", "audio", "video"}:
-            output.append(render_file_block(block, block_type, asset_dir))
+            asset_counter[0] += 1
+            output.append(render_file_block(block, block_type, asset_dir, asset_counter[0]))
 
         elif block_type == "embed":
             url = data.get("url", "")
@@ -672,7 +733,7 @@ def render_blocks(
 
         elif block_type in {"column_list", "column", "synced_block"}:
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter))
                 if block_type in {"column", "column_list"}:
                     output.append("\n")
 
@@ -686,7 +747,7 @@ def render_blocks(
             child_url = f"https://www.notion.so/{block.get('id', '').replace('-', '')}"
             output.append(f"[📄 {child_title}]({child_url})\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter))
 
         elif block_type == "child_database":
             db_title = data.get("title", "하위 데이터베이스")
@@ -713,13 +774,15 @@ def render_blocks(
             if content:
                 output.append(f"{indent_text}{content}\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter))
 
         else:
             # 알 수 없는 블록이라도 완전히 조용히 버리지 않고 유형을 기록합니다.
             output.append(f"<!-- Notion block type not yet converted: {block_type or 'unknown'} -->\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter))
+
+        previous_was_list = is_list_block
 
     return "".join(output)
 
