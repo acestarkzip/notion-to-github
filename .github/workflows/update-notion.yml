@@ -1,40 +1,294 @@
-name: Update Notion Log
+name: Update Notion Log (Safe Overlay)
 
 on:
   schedule:
-    # 매일 15:05 UTC (한국 시간 00:05) 실행
+    # 매일 15:05 UTC = 한국 시간 00:05
     - cron: '5 15 * * *'
-  workflow_dispatch: # 수동 실행 버튼
+  workflow_dispatch:
+    inputs:
+      fetch_mode:
+        description: '수동 실행 시 조회 범위 (ALL은 전체 Notion 기록, DAILY는 전날 기록만)'
+        required: true
+        type: choice
+        options:
+          - ALL
+          - DAILY
+        default: ALL
+
+# 이 workflow는 현재 저장소를 읽고, Pages 저장소는 SSH Deploy Key로 업데이트합니다.
+permissions:
+  contents: read
+
+# 수동/예약 실행이 동시에 목적지 저장소에 쓰지 않도록 직렬화합니다.
+concurrency:
+  group: notion-til-pages-safe-deploy
+  cancel-in-progress: false
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-          
-      - name: Install dependencies
-        run: pip install requests
 
-      - name: Run script
+    steps:
+      # 1) 원본 자동화 저장소: acestarkzip/notion-to-github
+      - name: Checkout Notion exporter repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip requests
+
+      # 예약 실행은 DAILY, 수동 실행은 기본 ALL (실행 화면에서 선택 가능)
+      - name: Run Notion exporter
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          FETCH_MODE: ${{ github.event_name == 'schedule' && 'DAILY' || inputs.fetch_mode || 'ALL' }}
+          RESET_MODE: 'false'
+          GITHUB_RAW_BASE_URL: https://raw.githubusercontent.com/acestarkzip/acestarkzip.github.io/main
         run: python update_readme.py
-        
-      - name: Commit and Push to GitHub Pages Repository
-        uses: cpina/github-action-push-to-another-repository@main
-        env:
-          SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
+
+      # 출력이 없으면 빈 데이터를 배포하지 않고 정상 종료합니다.
+      - name: Check generated TIL files
+        id: output
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          root = Path("TIL")
+          posts = []
+          if root.is_dir():
+              for path in root.rglob("*"):
+                  if not path.is_file() or path.suffix.lower() != ".md":
+                      continue
+                  relative_parts = path.relative_to(root).parts
+                  if any(part.lower().endswith("_assets") for part in relative_parts):
+                      continue
+                  if path.name.lower() == "readme.md":
+                      continue
+                  posts.append(path)
+
+          print(f"Notion 게시글 Markdown 수: {len(posts)}")
+          has_posts = "true" if posts else "false"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"has_posts={has_posts}\n")
+          if not posts:
+              print("이번 실행에서 배포할 TIL 게시글이 없습니다. 기존 Pages 파일은 변경하지 않습니다.")
+          PY
+
+      # 2) 목적지 Pages 저장소를 별도 폴더에 checkout합니다.
+      # SSH_DEPLOY_KEY는 acestarkzip.github.io 저장소에 등록된 쓰기 권한 Deploy Key여야 합니다.
+      - name: Checkout GitHub Pages repository
+        if: steps.output.outputs.has_posts == 'true'
+        uses: actions/checkout@v7
         with:
-          source-directory: 'TIL'  # 내 레포지토리에서 노션 파일들이 생성되는 폴더 이름 (예: TIL 또는 docs 등 본인 환경에 맞게 수정)
-          destination-github-username: 'acestarkzip'
-          destination-repository-name: 'acestarkzip.github.io'
-          user-email: 'acestark.zip@gmail.com'
-          target-directory: 'TIL'  # 상대방 블로그 레포지토리의 어디에 저장할지 지정
-          target-branch: 'main'
-  
+          repository: acestarkzip/acestarkzip.github.io
+          ref: main
+          path: pages-site
+          ssh-key: ${{ secrets.SSH_DEPLOY_KEY }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      # 3) 목적지에 이미 있던 모든 Markdown 경로를 기록하고,
+      # TIL을 삭제 없이 병합합니다. 기존 수동 작성 Markdown과 경로가 충돌하면 덮어쓰지 않고 실패합니다.
+      - name: Merge generated TIL without deleting existing files
+        if: steps.output.outputs.has_posts == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import filecmp
+          import json
+          import os
+          import shutil
+          from pathlib import Path
+
+          source_root = Path("TIL")
+          destination_repo = Path("pages-site")
+          destination_root = destination_repo / "TIL"
+          manifest_path = Path(os.environ["RUNNER_TEMP"]) / "existing-markdown-before.json"
+
+          if not source_root.is_dir():
+              raise SystemExit("[ERROR] 생성된 TIL 폴더가 없습니다.")
+          if not destination_repo.is_dir():
+              raise SystemExit("[ERROR] Pages 저장소 checkout에 실패했습니다.")
+
+          def markdown_paths(repo_root: Path):
+              result = []
+              for path in repo_root.rglob("*"):
+                  if not path.is_file() or path.suffix.lower() != ".md":
+                      continue
+                  if ".git" in path.relative_to(repo_root).parts:
+                      continue
+                  result.append(path.relative_to(repo_root).as_posix())
+              return sorted(result)
+
+          def is_asset_area(relative_path: Path) -> bool:
+              return any(part.lower().endswith("_assets") for part in relative_path.parts)
+
+          def is_notion_managed_markdown(path: Path) -> bool:
+              try:
+                  content = path.read_text(encoding="utf-8")
+              except (OSError, UnicodeError):
+                  return False
+              # 기존 exporter가 생성한 TIL 파일의 메타데이터 표식입니다.
+              return "> 원본 노션:" in content or "<!-- notion-to-github-managed -->" in content
+
+          existing_markdown_before = markdown_paths(destination_repo)
+          manifest_path.write_text(
+              json.dumps(existing_markdown_before, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+
+          destination_root.mkdir(parents=True, exist_ok=True)
+          added = 0
+          updated = 0
+          unchanged = 0
+          conflicts = []
+
+          source_files = sorted(p for p in source_root.rglob("*") if p.is_file())
+          for source_file in source_files:
+              if source_file.is_symlink():
+                  print(f"[WARN] 심볼릭 링크는 복사하지 않습니다: {source_file}")
+                  continue
+
+              relative_path = source_file.relative_to(source_root)
+              target_file = destination_root / relative_path
+              target_file.parent.mkdir(parents=True, exist_ok=True)
+
+              if not target_file.exists():
+                  shutil.copy2(source_file, target_file)
+                  added += 1
+                  print(f"[ADD] {relative_path.as_posix()}")
+                  continue
+
+              if target_file.is_dir():
+                  conflicts.append(f"파일/폴더 경로 충돌: {target_file}")
+                  continue
+
+              same = filecmp.cmp(source_file, target_file, shallow=False)
+              if same:
+                  unchanged += 1
+                  continue
+
+              if source_file.suffix.lower() == ".md":
+                  if is_asset_area(relative_path):
+                      # _assets/README.md는 자동 생성 갤러리이므로 새 버전으로 갱신합니다.
+                      shutil.copy2(source_file, target_file)
+                      updated += 1
+                      print(f"[UPDATE ASSET GALLERY] {relative_path.as_posix()}")
+                  elif is_notion_managed_markdown(target_file):
+                      # 동일 경로의 기존 Notion 생성 문서만 최신 Notion 내용으로 갱신합니다.
+                      shutil.copy2(source_file, target_file)
+                      updated += 1
+                      print(f"[UPDATE NOTION POST] {relative_path.as_posix()}")
+                  else:
+                      conflicts.append(
+                          f"수동 작성 Markdown 보호를 위해 덮어쓰기를 중단했습니다: {target_file}"
+                      )
+              elif is_asset_area(relative_path):
+                  # 페이지별 _assets 내부 미디어는 해당 Notion 페이지의 새 원본으로 갱신합니다.
+                  shutil.copy2(source_file, target_file)
+                  updated += 1
+                  print(f"[UPDATE ASSET] {relative_path.as_posix()}")
+              else:
+                  conflicts.append(
+                      f"기존 파일 보호를 위해 충돌 파일 덮어쓰기를 중단했습니다: {target_file}"
+                  )
+
+          if conflicts:
+              for message in conflicts:
+                  print(f"::error::{message}")
+              raise SystemExit(
+                  "동일한 경로에 기존 수동 파일이 있어 안전을 위해 배포를 중단했습니다. "
+                  "기존 파일은 변경하지 않았습니다."
+              )
+
+          existing_markdown_after = set(markdown_paths(destination_repo))
+          missing = sorted(set(existing_markdown_before) - existing_markdown_after)
+          if missing:
+              for item in missing:
+                  print(f"::error::기존 Markdown 파일이 사라졌습니다: {item}")
+              raise SystemExit("기존 Markdown 보존 검사 실패. 배포를 중단합니다.")
+
+          print("--- 병합 결과 ---")
+          print(f"새 파일: {added}")
+          print(f"갱신 파일: {updated}")
+          print(f"변경 없음: {unchanged}")
+          print(f"기존 Markdown 보존 확인: {len(existing_markdown_before)}개")
+          print("삭제 명령이나 --delete 옵션은 사용하지 않았습니다.")
+          PY
+
+      # 4) TIL만 스테이징합니다. Pages 저장소의 README.md, index.html, blog/, images/ 등은 건드리지 않습니다.
+      - name: Stage TIL changes and reject deletions
+        if: steps.output.outputs.has_posts == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C pages-site add -A -- TIL
+
+          deleted_files="$(git -C pages-site diff --cached --name-only --diff-filter=D -- TIL)"
+          if [[ -n "$deleted_files" ]]; then
+            echo "::error::TIL 파일 삭제가 감지되어 Push를 중단합니다."
+            printf '%s\n' "$deleted_files"
+            exit 1
+          fi
+
+          git -C pages-site diff --cached --check
+          git -C pages-site diff --cached --stat
+
+      # 5) 원격 변경을 rebase한 뒤에도 실행 시작 시 존재했던 Markdown이 모두 남아 있는지 재검사합니다.
+      - name: Commit and push safely
+        if: steps.output.outputs.has_posts == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git -C pages-site diff --cached --quiet; then
+            echo "배포할 변경 사항이 없습니다. 기존 파일은 그대로 유지합니다."
+            exit 0
+          fi
+
+          git -C pages-site config user.name "${GITHUB_ACTOR}"
+          git -C pages-site config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+          git -C pages-site commit -m "docs: safely merge Notion TIL"
+          git -C pages-site pull --rebase origin main
+
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          repo = Path("pages-site")
+          manifest = Path(os.environ["RUNNER_TEMP"]) / "existing-markdown-before.json"
+          previous = json.loads(manifest.read_text(encoding="utf-8"))
+          missing = [relative for relative in previous if not (repo / relative).is_file()]
+          if missing:
+              for relative in missing:
+                  print(f"::error::Push 전 기존 Markdown 누락 감지: {relative}")
+              raise SystemExit("기존 Markdown 보존 검사 실패. Push를 중단합니다.")
+          print(f"기존 Markdown {len(previous)}개가 모두 유지되었습니다.")
+          PY
+
+          deleted_after_rebase="$(git -C pages-site diff --name-only --diff-filter=D origin/main...HEAD -- TIL)"
+          if [[ -n "$deleted_after_rebase" ]]; then
+            echo "::error::Rebase 후 TIL 삭제가 감지되어 Push를 중단합니다."
+            printf '%s\n' "$deleted_after_rebase"
+            exit 1
+          fi
+
+          git -C pages-site push origin HEAD:main
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "Notion → GitHub Pages 안전 병합 작업이 종료되었습니다."
+          echo "기존 파일 삭제 방식(cpina push-to-another-repository)은 사용하지 않습니다."
