@@ -98,7 +98,8 @@ jobs:
           persist-credentials: true
 
       # 3) 목적지에 이미 있던 모든 Markdown 경로를 기록하고,
-      # TIL을 삭제 없이 병합합니다. 기존 수동 작성 Markdown과 경로가 충돌하면 덮어쓰지 않고 실패합니다.
+      # TIL을 삭제 없이 병합합니다. 기존 수동 작성 Markdown과 경로가 충돌하면
+      # 기존 파일은 그대로 두고 __notion 이름의 별도 파일로 추가합니다.
       - name: Merge generated TIL without deleting existing files
         if: steps.output.outputs.has_posts == 'true'
         shell: bash
@@ -186,14 +187,40 @@ jobs:
                       updated += 1
                       print(f"[UPDATE ASSET GALLERY] {relative_path.as_posix()}")
                   elif is_notion_managed_markdown(target_file):
-                      # 동일 경로의 기존 Notion 생성 문서만 최신 Notion 내용으로 갱신합니다.
+                      # Notion 메타데이터가 확인되는 기존 자동 생성 문서만 갱신합니다.
                       shutil.copy2(source_file, target_file)
                       updated += 1
                       print(f"[UPDATE NOTION POST] {relative_path.as_posix()}")
                   else:
-                      conflicts.append(
-                          f"수동 작성 Markdown 보호를 위해 덮어쓰기를 중단했습니다: {target_file}"
-                      )
+                      # 같은 경로에 수동 작성 파일이 있으면 원본을 절대 덮어쓰지 않습니다.
+                      # 대신 __notion 접미사의 별도 파일을 만들어 두 기록을 모두 보존합니다.
+                      base = target_file.with_name(f"{target_file.stem}__notion{target_file.suffix}")
+                      safe_target = base
+                      suffix_number = 2
+
+                      while safe_target.exists():
+                          if safe_target.is_file() and is_notion_managed_markdown(safe_target):
+                              break
+                          if safe_target.is_file() and filecmp.cmp(source_file, safe_target, shallow=False):
+                              break
+                          safe_target = target_file.with_name(
+                              f"{target_file.stem}__notion-{suffix_number}{target_file.suffix}"
+                          )
+                          suffix_number += 1
+
+                      if safe_target.exists() and safe_target.is_file():
+                          if filecmp.cmp(source_file, safe_target, shallow=False):
+                              unchanged += 1
+                              print(f"[UNCHANGED CONFLICT-SAFE COPY] {safe_target.relative_to(destination_repo).as_posix()}")
+                          else:
+                              shutil.copy2(source_file, safe_target)
+                              updated += 1
+                              print(f"[UPDATE CONFLICT-SAFE NOTION COPY] {safe_target.relative_to(destination_repo).as_posix()}")
+                      else:
+                          safe_target.parent.mkdir(parents=True, exist_ok=True)
+                          shutil.copy2(source_file, safe_target)
+                          added += 1
+                          print(f"[ADD CONFLICT-SAFE NOTION COPY] {safe_target.relative_to(destination_repo).as_posix()}")
               elif is_asset_area(relative_path):
                   # 페이지별 _assets 내부 미디어는 해당 Notion 페이지의 새 원본으로 갱신합니다.
                   shutil.copy2(source_file, target_file)
@@ -291,4 +318,5 @@ jobs:
         if: always()
         run: |
           echo "Notion → GitHub Pages 안전 병합 작업이 종료되었습니다."
+          echo "기존 파일은 삭제하지 않으며 수동 작성 Markdown과 경로가 충돌하면 __notion 별도 파일로 보존합니다."
           echo "기존 파일 삭제 방식(cpina push-to-another-repository)은 사용하지 않습니다."
