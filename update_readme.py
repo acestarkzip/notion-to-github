@@ -368,61 +368,177 @@ def extension_from_url_or_type(url: str, content_type: str = "") -> str:
     return guessed or ".bin"
 
 
+def sanitize_asset_label(name: str, max_length: int = 30) -> str:
+    """이미지/첨부 파일용 짧고 읽기 쉬운 파일명을 만듭니다.
+
+    한글과 영문, 숫자는 보존하고 공백/밑줄은 하이픈으로 정리합니다.
+    파일 확장자는 실제 다운로드한 파일 바이트를 기준으로 별도 결정합니다.
+    """
+    value = str(name or "").strip()
+    if not value:
+        return "image"
+    suffix = Path(value).suffix
+    if suffix and len(suffix) <= 10:
+        value = value[:-len(suffix)]
+    value = re.sub(r"[\s_]+", "-", value)
+    value = re.sub(r"[^\w가-힣-]", "", value, flags=re.UNICODE)
+    value = re.sub(r"-+", "-", value).strip("-.")
+    return (value[:max_length].rstrip("-.") or "image")
+
+
+def is_generic_asset_name(name: str) -> bool:
+    value = str(name or "").strip()
+    suffix = Path(value).suffix
+    if suffix and len(suffix) <= 10:
+        value = value[:-len(suffix)]
+    normalized = re.sub(r"[\W_]+", "", value.lower(), flags=re.UNICODE)
+    return normalized in {
+        "image", "이미지", "file", "파일", "attachment", "첨부파일",
+        "image파일", "이미지파일", "image첨부파일",
+    }
+
+
+def detect_actual_extension(prefix: bytes, url: str, content_type: str = "") -> str:
+    """파일 앞부분의 시그니처를 우선 확인해 실제 파일 형식에 맞는 확장자를 반환합니다."""
+    if prefix.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if prefix.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if prefix.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if prefix.startswith(b"RIFF") and prefix[8:12] == b"WEBP":
+        return ".webp"
+    if prefix.startswith(b"BM"):
+        return ".bmp"
+    if prefix.startswith((b"II*\x00", b"MM\x00*")):
+        return ".tif"
+    if prefix.startswith(b"%PDF-"):
+        return ".pdf"
+
+    stripped = prefix.lstrip(b"\xef\xbb\xbf\x00\t\r\n ").lower()
+    if b"<svg" in stripped[:512] or (stripped.startswith(b"<?xml") and b"<svg" in stripped[:1024]):
+        return ".svg"
+
+    mime = content_type.split(";")[0].strip().lower()
+    guessed = mimetypes.guess_extension(mime) if mime else None
+    if guessed == ".jpe":
+        guessed = ".jpg"
+    if guessed:
+        return guessed
+    return extension_from_url_or_type(url, content_type)
+
+
+def detect_image_extension(prefix: bytes) -> Optional[str]:
+    """이미지 응답의 실제 바이트 시그니처만으로 확장자를 판별합니다.
+
+    Content-Type만 보고 HTML 오류 페이지를 PNG/JPEG로 오인하지 않도록 합니다.
+    """
+    if prefix.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if prefix.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if prefix.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if prefix.startswith(b"RIFF") and prefix[8:12] == b"WEBP":
+        return ".webp"
+    if prefix.startswith(b"BM"):
+        return ".bmp"
+    if prefix.startswith((b"II*\x00", b"MM\x00*")):
+        return ".tif"
+    stripped = prefix.lstrip(b"\xef\xbb\xbf\x00\t\r\n ").lower()
+    if b"<svg" in stripped[:512] or (stripped.startswith(b"<?xml") and b"<svg" in stripped[:1024]):
+        return ".svg"
+    return None
+
+
 def download_notion_file(
     url: str,
     block_id: str,
     asset_dir: Path,
     preferred_name: str = "",
     asset_index: int = 0,
+    asset_kind: str = "file",
 ) -> Optional[str]:
-    """Notion이 발급한 임시 파일 URL을 저장하고 Markdown 상대 경로를 반환합니다."""
+    """Notion 파일을 짧고 구분하기 쉬운 이름으로 저장하고 Markdown 상대 경로를 반환합니다.
+
+    이미지 파일은 응답 본문 시그니처를 확인해 확장자 불일치/HTML 오류 페이지 저장을 방지합니다.
+    페이지별 asset_index와 의미 있는 이름을 결합해 서로 다른 이미지가 덮어써지지 않게 합니다.
+    """
     if not DOWNLOAD_NOTION_FILES or not url:
         return None
     if not url.startswith("https://"):
         return None
 
     asset_dir.mkdir(parents=True, exist_ok=True)
-    # Use the full block ID plus a stable URL-path fingerprint and page-order index.
-    # This prevents different Notion images from overwriting one another.
-    safe_id = re.sub(r"[^a-zA-Z0-9]", "", block_id)[:32] or "asset"
-    parsed_url = urlparse(url)
-    stable_url_identity = f"{parsed_url.netloc.lower()}{unquote(parsed_url.path)}"
-    url_fingerprint = hashlib.sha256(stable_url_identity.encode("utf-8")).hexdigest()[:10]
-    index_tag = f"{max(0, int(asset_index)):04d}"
+    index_tag = f"{max(1, int(asset_index)):02d}"
+    label = sanitize_asset_label(preferred_name or ("image" if asset_kind == "image" else asset_kind))
 
     try:
         with SESSION.get(url, stream=True, timeout=REQUEST_TIMEOUT_SECONDS) as response:
             response.raise_for_status()
             content_type = response.headers.get("Content-Type", "")
             content_length = response.headers.get("Content-Length")
-            if content_length and int(content_length) > MAX_DOWNLOAD_SIZE_MB * 1024 * 1024:
-                log(f">> [WARN] 파일이 {MAX_DOWNLOAD_SIZE_MB}MB를 초과하여 다운로드하지 않습니다: {preferred_name or url}")
-                return None
+            if content_length:
+                try:
+                    if int(content_length) > MAX_DOWNLOAD_SIZE_MB * 1024 * 1024:
+                        log(f">> [WARN] 파일이 {MAX_DOWNLOAD_SIZE_MB}MB를 초과하여 다운로드하지 않습니다: {preferred_name or url}")
+                        return None
+                except (TypeError, ValueError):
+                    pass
 
-            extension = extension_from_url_or_type(url, content_type)
-            base_name = sanitize_filename(preferred_name) if preferred_name else "file"
-            if Path(base_name).suffix:
-                extension = Path(base_name).suffix
-                base_name = Path(base_name).stem
-            filename = f"{safe_id}_{index_tag}_{url_fingerprint}_{base_name}{extension}"
-            destination = asset_dir / filename
-
+            # 응답을 임시 파일에 쓴 뒤 실제 바이트에 맞춰 확장자를 결정합니다.
+            temp_path = asset_dir / f".{index_tag}_{label}.download"
             total = 0
+            prefix = b""
             try:
-                with destination.open("wb") as file_handle:
-                    for chunk in response.iter_content(chunk_size=1024 * 64):
+                with temp_path.open("wb") as file_handle:
+                    for chunk in response.iter_content(chunk_size=64 * 1024):
                         if not chunk:
                             continue
+                        if len(prefix) < 2048:
+                            prefix += chunk[: 2048 - len(prefix)]
                         total += len(chunk)
                         if total > MAX_DOWNLOAD_SIZE_MB * 1024 * 1024:
-                            log(f">> [WARN] 다운로드 중 파일 크기 제한을 초과했습니다: {preferred_name or url}")
-                            raise ValueError("파일 크기 제한 초과")
+                            raise ValueError(f"다운로드 중 {MAX_DOWNLOAD_SIZE_MB}MB 제한 초과")
                         file_handle.write(chunk)
-            except Exception:
-                destination.unlink(missing_ok=True)
-                raise
 
-            return f"./{quote(asset_dir.name)}/{quote(filename)}"
+                if total == 0:
+                    raise ValueError("다운로드된 파일이 비어 있습니다.")
+
+                lowered_prefix = prefix.lstrip().lower()
+                if asset_kind == "image":
+                    looks_like_html = (
+                        "text/html" in content_type.lower()
+                        or lowered_prefix.startswith((b"<!doctype html", b"<html", b'{"error"'))
+                    )
+                    actual_ext = detect_image_extension(prefix)
+                    if looks_like_html or actual_ext is None:
+                        raise ValueError(
+                            f"이미지 응답이 유효한 이미지 형식이 아닙니다 (Content-Type: {content_type or 'unknown'})"
+                        )
+                else:
+                    actual_ext = detect_actual_extension(prefix, url, content_type)
+                    # 바이너리 MIME으로 내려오는 일반 첨부는 Notion 원본 이름의 확장자를 보조로 사용합니다.
+                    if actual_ext == ".bin":
+                        original_suffix = Path(str(preferred_name or "")).suffix
+                        if original_suffix:
+                            actual_ext = original_suffix.lower()
+
+                filename = f"{index_tag}_{label}{actual_ext}"
+                destination = asset_dir / filename
+                # 동일한 인덱스/이름의 충돌도 방지합니다.
+                collision = 2
+                while destination.exists():
+                    filename = f"{index_tag}_{label}-{collision}{actual_ext}"
+                    destination = asset_dir / filename
+                    collision += 1
+
+                temp_path.replace(destination)
+                return f"./{quote(asset_dir.name, safe='')}/{quote(filename, safe='')}"
+
+            except Exception:
+                temp_path.unlink(missing_ok=True)
+                raise
 
     except (requests.RequestException, OSError, ValueError) as exc:
         log(f">> [WARN] 파일 다운로드 실패. 원본 링크를 사용합니다: {exc}")
@@ -539,16 +655,33 @@ def render_file_block(
     block_type: str,
     asset_dir: Path,
     asset_index: int = 0,
+    context_label: str = "",
 ) -> str:
     data = block.get(block_type, {}) or {}
     url, source_type = get_media_source(data)
     caption = get_caption(data)
-    title = caption or data.get("name") or f"{block_type.upper()} 파일"
+    original_name = str(data.get("name") or "").strip()
+
+    # Notion의 기본 파일명(예: IMAGE 파일)은 설명력이 낮으므로
+    # 캡션이 없으면 현재 위치의 가장 가까운 제목을 사용합니다.
+    if caption:
+        title = caption
+    elif original_name and not is_generic_asset_name(original_name):
+        title = original_name
+    elif context_label:
+        title = context_label
+    else:
+        title = "이미지" if block_type == "image" else f"{block_type.upper()} 파일"
 
     local_path = None
     if source_type == "file":
         local_path = download_notion_file(
-            url, block.get("id", ""), asset_dir, title, asset_index=asset_index
+            url,
+            block.get("id", ""),
+            asset_dir,
+            title,
+            asset_index=asset_index,
+            asset_kind=block_type,
         )
 
     target = local_path or url
@@ -556,7 +689,8 @@ def render_file_block(
         return f"> [파일을 가져오지 못했습니다: {title}]\n\n"
 
     if block_type == "image":
-        return f"![{caption or 'Image'}]({target})\n\n"
+        # alt text는 사용자가 넣은 캡션 또는 의미 있는 현재 섹션명을 사용합니다.
+        return f"![{caption or title}]({target})\n\n"
 
     label = "PDF 문서 열기" if block_type == "pdf" else title
     if block_type == "video" and url and youtube_video_id(url):
@@ -609,10 +743,13 @@ def render_blocks(
     indent: int = 0,
     toc_markdown: str = "",
     asset_counter: Optional[List[int]] = None,
+    asset_context: Optional[List[str]] = None,
 ) -> str:
-    # Shared counter across nested blocks gives every media block a unique index.
+    # Shared counter/context across nested blocks keeps asset names unique and meaningful.
     if asset_counter is None:
         asset_counter = [0]
+    if asset_context is None:
+        asset_context = [""]
     output: List[str] = []
     indent_text = " " * indent
     list_block_types = {"bulleted_list_item", "numbered_list_item", "to_do"}
@@ -644,10 +781,13 @@ def render_blocks(
             if content.strip():
                 output.append(f"{indent_text}{content}\n\n")
             elif children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, asset_context))
 
         elif block_type in {"heading_1", "heading_2", "heading_3"}:
             level = int(block_type[-1])
+            plain_heading = plain_text(rich).strip()
+            if plain_heading:
+                asset_context[0] = plain_heading
             # Notion 목차 블록이 있는 문서에서는 제목 바로 앞에 고유한 HTML anchor를
             # 직접 삽입합니다. 링크가 GitHub의 자동 slug 규칙에 의존하지 않게 합니다.
             if toc_markdown:
@@ -655,28 +795,28 @@ def render_blocks(
                 output.append(f'<a name="{anchor}"></a>\n\n')
             output.append(f"{indent_text}{'#' * level} {content}\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, asset_context))
 
         elif block_type == "bulleted_list_item":
             output.append(f"{indent_text}- {content}\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent + 2, toc_markdown, asset_counter))
+                output.append(render_blocks(children, asset_dir, indent + 2, toc_markdown, asset_counter, asset_context))
 
         elif block_type == "numbered_list_item":
             output.append(f"{indent_text}1. {content}\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent + 3, toc_markdown, asset_counter))
+                output.append(render_blocks(children, asset_dir, indent + 3, toc_markdown, asset_counter, asset_context))
 
         elif block_type == "to_do":
             checked = "x" if data.get("checked") else " "
             output.append(f"{indent_text}- [{checked}] {content}\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent + 2, toc_markdown, asset_counter))
+                output.append(render_blocks(children, asset_dir, indent + 2, toc_markdown, asset_counter, asset_context))
 
         elif block_type == "toggle":
             output.append(f"{indent_text}<details>\n{indent_text}<summary>{content or '자세히 보기'}</summary>\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, asset_context))
             output.append(f"{indent_text}</details>\n\n")
 
         elif block_type == "quote":
@@ -689,7 +829,7 @@ def render_blocks(
             quote_lines = (content or " ").splitlines() or [" "]
             output.append("\n".join(f"{indent_text}> {icon} {line}" for line in quote_lines) + "\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, asset_context))
 
         elif block_type == "code":
             # GitHub applies syntax highlighting based on this language identifier.
@@ -699,11 +839,15 @@ def render_blocks(
 
         elif block_type == "image":
             asset_counter[0] += 1
-            output.append(render_file_block(block, "image", asset_dir, asset_counter[0]))
+            output.append(render_file_block(
+                block, "image", asset_dir, asset_counter[0], context_label=asset_context[0]
+            ))
 
         elif block_type in {"file", "pdf", "audio", "video"}:
             asset_counter[0] += 1
-            output.append(render_file_block(block, block_type, asset_dir, asset_counter[0]))
+            output.append(render_file_block(
+                block, block_type, asset_dir, asset_counter[0], context_label=asset_context[0]
+            ))
 
         elif block_type == "embed":
             url = data.get("url", "")
@@ -735,7 +879,7 @@ def render_blocks(
 
         elif block_type in {"column_list", "column", "synced_block"}:
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, asset_context))
                 if block_type in {"column", "column_list"}:
                     output.append("\n")
 
@@ -749,7 +893,7 @@ def render_blocks(
             child_url = f"https://www.notion.so/{block.get('id', '').replace('-', '')}"
             output.append(f"[📄 {child_title}]({child_url})\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, asset_context))
 
         elif block_type == "child_database":
             db_title = data.get("title", "하위 데이터베이스")
@@ -776,13 +920,13 @@ def render_blocks(
             if content:
                 output.append(f"{indent_text}{content}\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, asset_context))
 
         else:
             # 알 수 없는 블록이라도 완전히 조용히 버리지 않고 유형을 기록합니다.
             output.append(f"<!-- Notion block type not yet converted: {block_type or 'unknown'} -->\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, asset_context))
 
         previous_was_list = is_list_block
 
@@ -792,6 +936,33 @@ def render_blocks(
 # =======================================================
 # [Notion 페이지 저장]
 # =======================================================
+
+def cleanup_unused_assets(asset_dir: Path, markdown_content: str) -> None:
+    """새 Markdown에서 더 이상 참조하지 않는 예전 자산 파일을 정리합니다.
+
+    파일명 규칙 변경 전의 긴 해시 파일명이 저장소에 계속 남지 않도록 합니다.
+    해당 폴더는 이 스크립트가 관리하는 페이지별 _assets 폴더입니다.
+    """
+    if not asset_dir.exists() or not asset_dir.is_dir():
+        return
+
+    for asset_path in asset_dir.iterdir():
+        if not asset_path.is_file():
+            continue
+        relative = f"./{quote(asset_dir.name, safe='')}/{quote(asset_path.name, safe='')}"
+        if relative not in markdown_content:
+            try:
+                asset_path.unlink()
+                log(f">> [INFO] 사용하지 않는 이전 미디어 파일 정리: {asset_path.name}")
+            except OSError as exc:
+                log(f">> [WARN] 이전 미디어 파일 정리 실패 ({asset_path.name}): {exc}")
+
+    try:
+        if not any(asset_dir.iterdir()):
+            asset_dir.rmdir()
+    except OSError:
+        pass
+
 
 def save_as_markdown(page: Dict[str, Any], date_str: str) -> Tuple[str, Path]:
     date_str = str(date_str)[:10]
@@ -826,9 +997,15 @@ def save_as_markdown(page: Dict[str, Any], date_str: str) -> Tuple[str, Path]:
     markdown_content += f"> 날짜: {date_str}\n"
     markdown_content += f"> 원본 노션: [링크]({page.get('url', '')})\n\n"
     markdown_content += "---\n\n"
-    markdown_content += render_blocks(blocks, asset_dir, toc_markdown=toc_markdown)
+    markdown_content += render_blocks(
+        blocks,
+        asset_dir,
+        toc_markdown=toc_markdown,
+        asset_context=[title],
+    )
 
     # 반복 배포 시 오래된 파일이 남지 않도록 빈 자산 폴더는 만들지 않습니다.
+    cleanup_unused_assets(asset_dir, markdown_content)
     filename.write_text(markdown_content.rstrip() + "\n", encoding="utf-8")
 
     return title, filename
