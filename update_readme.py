@@ -405,7 +405,9 @@ def is_generic_asset_name(name: str) -> bool:
     if suffix and len(suffix) <= 10:
         value = value[:-len(suffix)]
     normalized = re.sub(r"[\W_]+", "", value.lower(), flags=re.UNICODE)
-    return normalized in {
+    # Notion 또는 원본 업로더가 파일명을 "5", "01"처럼 숫자만으로
+    # 지정하는 경우에는 의미 있는 파일명으로 취급하지 않고 Heading 문맥을 사용합니다.
+    return value.isdigit() or normalized in {
         "image", "이미지", "file", "파일", "attachment", "첨부파일",
         "image파일", "이미지파일", "image첨부파일",
     }
@@ -711,6 +713,8 @@ def render_file_block(
     # Heading이 비어 있거나 아직 등장하지 않았다면 상위 Heading 또는 페이지 제목을 사용합니다.
     # 단, alt text에는 아래에서 Notion 캡션을 계속 우선 적용합니다.
     if block_type == "image" and context_label:
+        # 이미지 파일명은 Notion 캡션/업로드 파일명보다 Heading 문맥을 우선합니다.
+        # 이는 사용자가 요청한 "가장 낮은 Heading → 상위 Heading → 페이지 제목" 규칙입니다.
         title = context_label
     elif caption:
         title = caption
@@ -720,6 +724,13 @@ def render_file_block(
         title = context_label
     else:
         title = "이미지" if block_type == "image" else f"{block_type.upper()} 파일"
+
+    if block_type == "image":
+        log(
+            f">> [MEDIA-NAME] block={str(block.get('id', ''))[:8]} "
+            f"heading='{context_label or '(없음)'}' original='{original_name or '(없음)'}' "
+            f"=> filename_label='{title}'"
+        )
 
     local_path = None
     # Notion 파일 URL(file)뿐 아니라 외부 이미지 URL(external)도 로컬로 내려받습니다.
@@ -734,6 +745,8 @@ def render_file_block(
             asset_index=asset_index,
             asset_kind=block_type,
         )
+        if block_type == "image" and local_path:
+            log(f">> [MEDIA-NAME] saved='{Path(unquote(urlparse(local_path).path)).name}'")
 
     target = local_path or url
     if not target:
