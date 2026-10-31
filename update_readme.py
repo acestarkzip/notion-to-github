@@ -7,6 +7,7 @@ Required environment variables:
 Optional environment variables:
     FETCH_MODE            DAILY (default) or ALL
     RESET_MODE            true / false (default false)
+    GITHUB_RAW_BASE_URL   Raw URL base for the destination repository (optional)
 
 The script intentionally keeps the original Notion API version (2022-06-28)
 so that the existing /v1/databases/{id}/query workflow remains compatible.
@@ -52,6 +53,14 @@ REQUEST_TIMEOUT_SECONDS = 30
 MAX_API_RETRIES = 4
 MAX_BLOCK_DEPTH = 30
 API_MIN_INTERVAL_SECONDS = 0.35  # Notion API 요청 속도 제한을 고려
+
+# Markdown Preview에서 이미지를 클릭하면 GitHub의 blob 파일 페이지가 아니라
+# raw 이미지 자체가 열리도록 합니다. 현재 자동 배포 대상 저장소 기준값입니다.
+# 다른 저장소/브랜치로 변경하면 GitHub Actions 환경 변수로 덮어쓸 수 있습니다.
+GITHUB_RAW_BASE_URL = os.environ.get(
+    "GITHUB_RAW_BASE_URL",
+    "https://raw.githubusercontent.com/acestarkzip/acestarkzip.github.io/main",
+).strip().rstrip("/")
 
 DEFAULT_README_TEMPLATE = f"""# 📝 My TIL Collection
 
@@ -650,6 +659,26 @@ def get_caption(media_data: Dict[str, Any]) -> str:
     return plain_text(media_data.get("caption", [])).strip()
 
 
+def github_raw_url_for_asset(asset_dir: Path, local_markdown_path: str) -> Optional[str]:
+    """저장소 내부 이미지 경로를 raw.githubusercontent.com 주소로 변환합니다.
+
+    GitHub Markdown Preview에서 이미지 자체는 정상 표시되지만, 이미지를 클릭하면
+    GitHub의 blob 페이지에서 미리보기가 깨지는 경우가 있습니다. 이때 이미지 클릭
+    목적지를 raw URL로 지정하면 파일 뷰어를 거치지 않고 이미지 바이너리를 바로 엽니다.
+    """
+    if not GITHUB_RAW_BASE_URL or not local_markdown_path:
+        return None
+
+    parsed_path = unquote(urlparse(local_markdown_path).path)
+    filename = Path(parsed_path).name
+    if not filename:
+        return None
+
+    repo_relative_path = (asset_dir / filename).as_posix().lstrip("./")
+    encoded_path = quote(repo_relative_path, safe="/-._~")
+    return f"{GITHUB_RAW_BASE_URL}/{encoded_path}"
+
+
 def render_file_block(
     block: Dict[str, Any],
     block_type: str,
@@ -690,7 +719,16 @@ def render_file_block(
 
     if block_type == "image":
         # alt text는 사용자가 넣은 캡션 또는 의미 있는 현재 섹션명을 사용합니다.
-        return f"![{caption or title}]({target})\n\n"
+        alt_text = (caption or title).replace("[", "\\[").replace("]", "\\]")
+        image_markdown = f"![{alt_text}]({target})"
+
+        # 로컬 저장 이미지라면 클릭했을 때 GitHub blob 페이지가 아니라 raw 이미지가 열리게 합니다.
+        # 외부 URL 이미지라면 원본 URL 자체가 이미지 응답이므로 해당 URL로 연결합니다.
+        click_url = github_raw_url_for_asset(asset_dir, local_path) if local_path else url
+        if click_url:
+            click_url = click_url.replace("(", "%28").replace(")", "%29").replace(" ", "%20")
+            return f"[{image_markdown}]({click_url})\n\n"
+        return image_markdown + "\n\n"
 
     label = "PDF 문서 열기" if block_type == "pdf" else title
     if block_type == "video" and url and youtube_video_id(url):
