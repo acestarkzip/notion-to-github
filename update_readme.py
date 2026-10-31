@@ -32,6 +32,8 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
+EXPORTER_VERSION = "2026.11.01-heading-asset-fix-01"
+
 SAVE_DIR_ROOT = Path("TIL")
 NOTION_PROPERTY_TITLE = "제목"
 NOTION_PROPERTY_DATE = "날짜"
@@ -390,9 +392,20 @@ def sanitize_asset_label(name: str, max_length: int = 30) -> str:
     value = str(name or "").strip()
     if not value:
         return "image"
-    suffix = Path(value).suffix
-    if suffix and len(suffix) <= 10:
+    # Path.suffix는 "5. 참고 자료"의 ". 참고 자료"까지 확장자로 오인할 수 있습니다.
+    # 실제 미디어/문서 확장자로 확인되는 경우에만 제거합니다.
+    suffix = Path(value).suffix.lower()
+    known_extensions = {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".svg",
+        ".pdf", ".mp4", ".mov", ".avi", ".webm", ".mp3", ".wav", ".m4a",
+        ".zip", ".csv", ".txt", ".md", ".ppt", ".pptx", ".doc", ".docx",
+        ".xls", ".xlsx",
+    }
+    if suffix in known_extensions:
         value = value[:-len(suffix)]
+    # Heading의 앞쪽 번호(예: "5. 참고 자료", "2.1. 회귀")는
+    # 순번 prefix와 중복되므로 파일명 label에서는 제거합니다.
+    value = re.sub(r"^\s*\d+(?:\.\d+)*[.)]\s*", "", value)
     value = re.sub(r"[\s_]+", "-", value)
     value = re.sub(r"[^\w가-힣-]", "", value, flags=re.UNICODE)
     value = re.sub(r"-+", "-", value).strip("-.")
@@ -1295,6 +1308,9 @@ def query_database(fetch_mode: str) -> List[Dict[str, Any]]:
 
 def main() -> None:
     global NOTION_TOKEN, DATABASE_ID, HEADERS
+
+    log(f">> [EXPORTER VERSION] {EXPORTER_VERSION}")
+    log(f">> [EXPORTER SOURCE] {Path(__file__).resolve()}")
 
     NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "").strip()
     DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "").strip()
