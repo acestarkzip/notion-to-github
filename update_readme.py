@@ -4,29 +4,29 @@ import re
 from datetime import datetime, timezone, timedelta
 
 # =======================================================
-# [사용자 설정 영역]
+# [ 설정 ]
 # =======================================================
 
 SAVE_DIR_ROOT = "TIL" 
-NOTION_PROPERTY_TITLE = "제목"
-NOTION_PROPERTY_DATE = "날짜"
+NOTION_PROPERTY_TITLE = "제목"  # 사용 중인 노션 제목 속성명에 맞게 변경해 주세요
+NOTION_PROPERTY_DATE = "날짜"    # 사용 중인 노션 날짜 속성명에 맞게 변경해 주세요
 README_FILE = "README.md"
-MARKER_START = ""
-MARKER_END = ""
+MARKER_START = "<!-- START_SECTION:til -->"
+MARKER_END = "<!-- END_SECTION:til -->"
 TIMEZONE_HOURS = 9 
 
-# 초기화 모드일 때 사용될 기본 템플릿
-DEFAULT_README_TEMPLATE = f"""# 📝 My TIL Collection
+# 기본 README 템플릿
+DEFAULT_README_TEMPLATE = f"""# 📚 My TIL Collection
 
-노션에서 작성된 TIL(Today I Learned)이 자동으로 업로드되는 저장소입니다.
+매일 학습한 TIL(Today I Learned) 기록입니다.
 
-## 📚 글 목록
+## 최근 기록
 {MARKER_START}
 {MARKER_END}
 """
 
 # =======================================================
-# [시스템 설정]
+# [ 환경변수 및 헤더 ]
 # =======================================================
 NOTION_TOKEN = os.environ['NOTION_TOKEN']
 DATABASE_ID = os.environ['NOTION_DATABASE_ID']
@@ -37,10 +37,21 @@ headers = {
     "Notion-Version": "2022-06-28"
 }
 
-def get_page_blocks(page_id):
-    url = f"https://api.notion.com/v1/blocks/{page_id}/children"
+def get_page_blocks(block_id):
+    """
+    특정 페이지 또는 블록의 자식 블록들을 재귀적으로 가져옵니다.
+    """
+    url = f"https://api.notion.com/v1/blocks/{block_id}/children"
     response = requests.get(url, headers=headers)
-    return response.json().get('results', [])
+    results = response.json().get('results', [])
+    
+    blocks = []
+    for block in results:
+        # 자식 블록이 존재할 경우 재귀적으로 탐색
+        if block.get('has_children'):
+            block['children'] = get_page_blocks(block['id'])
+        blocks.append(block)
+    return blocks
 
 def extract_text_from_rich_text(rich_text_list):
     content = ""
@@ -53,33 +64,59 @@ def extract_text_from_rich_text(rich_text_list):
             content += plain
     return content
 
-def block_to_markdown(block):
+def block_to_markdown(block, depth=0):
+    """
+    depth 인자를 받아 하위 계층일수록 들여쓰기 공백을 추가하여
+    GitHub Markdown 프리뷰에서 깨지지 않는 리스트를 생성합니다.
+    """
     b_type = block['type']
+    indent = "  " * depth  # 깊이에 따른 2칸 들여쓰기
+    markdown_output = ""
+
     if b_type in ['paragraph', 'heading_1', 'heading_2', 'heading_3', 'bulleted_list_item', 'numbered_list_item', 'to_do', 'toggle', 'quote', 'callout']:
         rich_text = block[b_type].get('rich_text', [])
         content = extract_text_from_rich_text(rich_text)
-        if b_type == 'paragraph': return content + "\n\n"
-        elif b_type == 'heading_1': return f"# {content}\n\n"
-        elif b_type == 'heading_2': return f"## {content}\n\n"
-        elif b_type == 'heading_3': return f"### {content}\n\n"
-        elif b_type == 'bulleted_list_item': return f"- {content}\n"
-        elif b_type == 'numbered_list_item': return f"1. {content}\n"
+        
+        if b_type == 'paragraph': 
+            if content.strip():
+                markdown_output += f"{indent}{content}\n\n"
+        elif b_type == 'heading_1': 
+            markdown_output += f"\n# {content}\n\n"
+        elif b_type == 'heading_2': 
+            markdown_output += f"\n## {content}\n\n"
+        elif b_type == 'heading_3': 
+            markdown_output += f"\n### {content}\n\n"
+        elif b_type == 'bulleted_list_item': 
+            markdown_output += f"{indent}- {content}\n"
+        elif b_type == 'numbered_list_item': 
+            markdown_output += f"{indent}1. {content}\n"
         elif b_type == 'to_do':
             checked = "[x]" if block['to_do']['checked'] else "[ ]"
-            return f"- {checked} {content}\n"
-        elif b_type == 'quote': return f"> {content}\n\n"
-        elif b_type == 'callout': return f"> 💡 {content}\n\n"
-        elif b_type == 'toggle': return f"- ▶ {content}\n"
+            markdown_output += f"{indent}- {checked} {content}\n"
+        elif b_type == 'quote': 
+            markdown_output += f"{indent}> {content}\n\n"
+        elif b_type == 'callout': 
+            markdown_output += f"{indent}> 💡 {content}\n\n"
+        elif b_type == 'toggle': 
+            markdown_output += f"{indent}- {content}\n"
+            
     elif b_type == 'code':
         language = block['code'].get('language', 'text')
         rich_text = block['code'].get('rich_text', [])
         content = extract_text_from_rich_text(rich_text)
-        return f"```{language}\n{content}\n```\n\n"
+        markdown_output += f"{indent}```{language}\n{content}\n{indent}```\n\n"
     elif b_type == 'image':
         url = block['image'].get('file', {}).get('url') or block['image'].get('external', {}).get('url') or ""
-        return f"![Image]({url})\n\n"
-    elif b_type == 'divider': return "---\n\n"
-    return ""
+        markdown_output += f"{indent}![Image]({url})\n\n"
+    elif b_type == 'divider': 
+        markdown_output += f"\n---\n\n"
+
+    # 자식 블록이 있으면 depth + 1을 전달하여 처리
+    if block.get('children'):
+        for child in block['children']:
+            markdown_output += block_to_markdown(child, depth + 1)
+
+    return markdown_output
 
 def sanitize_filename(title):
     clean_name = re.sub(r'[\\/*?:"<>|]', "", title)
@@ -94,7 +131,7 @@ def save_as_markdown(page, date_str):
     try:
         title = page['properties'][NOTION_PROPERTY_TITLE]['title'][0]['text']['content']
     except:
-        title = "제목없음"
+        title = "Untitled"
     
     date_obj = datetime.strptime(date_str, "%Y-%m-%d")
     year = date_obj.strftime("%Y")
@@ -113,7 +150,7 @@ def save_as_markdown(page, date_str):
     markdown_content += "---\n\n"
     
     for block in blocks:
-        markdown_content += block_to_markdown(block)
+        markdown_content += block_to_markdown(block, depth=0)
     
     with open(filename, "w", encoding="utf-8") as f:
         f.write(markdown_content)
@@ -147,7 +184,7 @@ def update_main_readme_by_scanning(reset_mode):
 
     grouped = {}
     for item in files_data:
-        month_key = item["date"].strftime("%Y년 %m월")
+        month_key = item["date"].strftime("%Y %m")
         if month_key not in grouped:
             grouped[month_key] = []
         grouped[month_key].append(item)
@@ -162,19 +199,17 @@ def update_main_readme_by_scanning(reset_mode):
             new_content += "\n"
         else:
             new_content += f"<details>\n"
-            new_content += f"<summary>{month} ({len(items)}개)</summary>\n\n"
+            new_content += f"<summary>{month} ({len(items)})</summary>\n\n"
             for item in items:
                 safe_path = item["path"].replace(" ", "%20")
                 new_content += f"- [{item['date_str']} : {item['title']}](./{safe_path})\n"
             new_content += "\n</details>\n\n"
 
-    # RESET 모드이거나 파일이 없으면 템플릿으로 덮어쓰기
     if reset_mode == 'true' or not os.path.exists(README_FILE):
-        print(f">> [INFO] README.md를 초기화합니다. (RESET_MODE: {reset_mode})")
+        print(f">> [INFO] README.md 생성. (RESET_MODE: {reset_mode})")
         with open(README_FILE, "w", encoding="utf-8") as f:
             f.write(DEFAULT_README_TEMPLATE)
 
-    # 기존 읽기
     with open(README_FILE, "r", encoding="utf-8") as f:
         readme_text = f.read()
 
@@ -182,10 +217,8 @@ def update_main_readme_by_scanning(reset_mode):
     end_idx = readme_text.find(MARKER_END)
 
     if start_idx == -1 or end_idx == -1:
-        # 마커가 없으면(혹은 깨졌으면) 그냥 뒤에 추가
         final_content = readme_text + f"\n\n{MARKER_START}\n{new_content}{MARKER_END}"
     else:
-        # 마커 사이 교체
         final_content = (
             readme_text[:start_idx + len(MARKER_START)] + 
             "\n" + new_content + 
@@ -197,17 +230,17 @@ def update_main_readme_by_scanning(reset_mode):
 
 def main():
     fetch_mode = os.environ.get('FETCH_MODE', 'DAILY')
-    reset_mode = os.environ.get('RESET_MODE', 'false').lower() # 문자열 'true'/'false' 처리
+    reset_mode = os.environ.get('RESET_MODE', 'false').lower()
     
     url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
     payload = {}
 
     if fetch_mode == "ALL":
-        print(">> [모드: 전체] 모든 데이터를 조회합니다.")
+        print(">> [모드: ALL] 전체 데이터를 가져옵니다.")
     else:
         kst = timezone(timedelta(hours=TIMEZONE_HOURS))
         target_date = (datetime.now(kst) - timedelta(days=1)).strftime("%Y-%m-%d")
-        print(f">> [모드: 일간] {target_date} 데이터를 조회합니다.")
+        print(f">> [모드: DAILY] {target_date} 데이터를 가져옵니다.")
         payload["filter"] = {
             "property": NOTION_PROPERTY_DATE,
             "date": { "equals": target_date }
@@ -234,7 +267,7 @@ def main():
                 continue
 
             title, filepath = save_as_markdown(page, page_date)
-            print(f"DEBUG: 저장 완료 - {page_date} : {title}")
+            print(f"DEBUG: 변환 완료 - {page_date} : {title}")
         
         has_more = data.get('has_more', False)
         next_cursor = data.get('next_cursor')
