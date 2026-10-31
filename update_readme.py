@@ -41,9 +41,8 @@ TIMEZONE_HOURS = 9
 MARKER_START = "<!-- TIL_LIST_START -->"
 MARKER_END = "<!-- TIL_LIST_END -->"
 
-# 각 TIL 문서에 목차를 자동으로 생성합니다.
-GENERATE_TABLE_OF_CONTENTS = True
-TOC_TITLE = "## 📑 목차"
+# Notion 페이지에 table_of_contents 블록이 있을 때만 해당 위치에 목차를 렌더링합니다.
+# GitHub는 Notion의 네이티브 목차 위젯을 지원하지 않으므로 Markdown 링크 목록으로 변환합니다.
 
 # Notion 파일을 GitHub 저장소에 내려받을 때 사용할 설정
 DOWNLOAD_NOTION_FILES = True
@@ -156,15 +155,30 @@ def get_paginated_results(
 
 
 def plain_text(rich_text_list: Optional[List[Dict[str, Any]]]) -> str:
-    """Notion rich_text 배열에서 서식 없는 텍스트를 추출합니다."""
+    """Notion rich_text 배열에서 서식 없는 텍스트를 안전하게 추출합니다.
+
+    Notion API는 mention/equation 등의 항목에서 `text`가 null일 수 있으므로
+    중첩 값을 딕셔너리라고 가정하지 않습니다.
+    """
     parts: List[str] = []
     for item in rich_text_list or []:
-        if item.get("plain_text") is not None:
-            parts.append(str(item["plain_text"]))
-        elif item.get("text", {}).get("content") is not None:
-            parts.append(str(item["text"]["content"]))
-        elif item.get("equation", {}).get("expression") is not None:
-            parts.append(str(item["equation"]["expression"]))
+        if not isinstance(item, dict):
+            continue
+
+        plain = item.get("plain_text")
+        if plain is not None:
+            parts.append(str(plain))
+            continue
+
+        text_data = item.get("text")
+        if isinstance(text_data, dict) and text_data.get("content") is not None:
+            parts.append(str(text_data["content"]))
+            continue
+
+        equation_data = item.get("equation")
+        if isinstance(equation_data, dict) and equation_data.get("expression") is not None:
+            parts.append(str(equation_data["expression"]))
+
     return "".join(parts)
 
 
@@ -173,7 +187,16 @@ def rich_text_to_markdown(rich_text_list: Optional[List[Dict[str, Any]]]) -> str
     output: List[str] = []
 
     for item in rich_text_list or []:
-        text_value = str(item.get("plain_text", item.get("text", {}).get("content", "")))
+        if not isinstance(item, dict):
+            continue
+
+        text_data = item.get("text")
+        if not isinstance(text_data, dict):
+            text_data = {}
+        text_value = item.get("plain_text")
+        if text_value is None:
+            text_value = text_data.get("content", "")
+        text_value = str(text_value or "")
         if not text_value:
             continue
 
@@ -194,8 +217,13 @@ def rich_text_to_markdown(rich_text_list: Optional[List[Dict[str, Any]]]) -> str
             if annotations.get("underline"):
                 value = f"<u>{value}</u>"
 
-        href = item.get("href") or item.get("text", {}).get("link", {}).get("url")
+        link_data = text_data.get("link")
+        if not isinstance(link_data, dict):
+            link_data = {}
+        href = item.get("href") or link_data.get("url")
         if href:
+            # Markdown URL 괄호/공백을 안전하게 인코딩합니다.
+            href = str(href).replace("(", "%28").replace(")", "%29").replace(" ", "%20")
             value = f"[{value}]({href})"
 
         # Notion의 글자색/배경색은 GitHub Markdown에서 동일하게 재현되지 않아 텍스트는 유지합니다.
@@ -424,18 +452,30 @@ def collect_headings(
 
 
 def build_table_of_contents(headings: List[Dict[str, Any]]) -> str:
-    if not GENERATE_TABLE_OF_CONTENTS or not headings:
+    """Notion table_of_contents 블록 위치에 넣을 GitHub용 목차를 만듭니다.
+
+    목차 블록이 실제 Notion 페이지에 존재할 때만 호출합니다.
+    별도의 제목이나 구분선은 추가하지 않아 Notion 페이지의 배치를 최대한 유지합니다.
+    """
+    if not headings:
         return ""
 
     min_level = min(item["level"] for item in headings)
-    lines = [TOC_TITLE, ""]
+    lines: List[str] = []
     for item in headings:
         indent = "  " * max(0, item["level"] - min_level)
         lines.append(f"{indent}- [{item['title']}](#{item['slug']})")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n\n"
+
+
+def contains_table_of_contents(blocks: Iterable[Dict[str, Any]]) -> bool:
+    """페이지 어디에든 Notion 목차 블록이 직접 삽입되어 있는지 확인합니다."""
+    for block in blocks:
+        if block.get("type") == "table_of_contents":
+            return True
+        if contains_table_of_contents(block.get("_children", []) or []):
+            return True
+    return False
 
 
 # =======================================================
@@ -522,6 +562,7 @@ def render_blocks(
     blocks: Iterable[Dict[str, Any]],
     asset_dir: Path,
     indent: int = 0,
+    toc_markdown: str = "",
 ) -> str:
     output: List[str] = []
     indent_text = " " * indent
@@ -537,35 +578,35 @@ def render_blocks(
             if content.strip():
                 output.append(f"{indent_text}{content}\n\n")
             elif children:
-                output.append(render_blocks(children, asset_dir, indent))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown))
 
         elif block_type in {"heading_1", "heading_2", "heading_3"}:
             level = int(block_type[-1])
             # GitHub가 Markdown 제목에서 자동 생성하는 anchor를 사용합니다.
             output.append(f"{indent_text}{'#' * level} {content}\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown))
 
         elif block_type == "bulleted_list_item":
             output.append(f"{indent_text}- {content}\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent + 2))
+                output.append(render_blocks(children, asset_dir, indent + 2, toc_markdown))
 
         elif block_type == "numbered_list_item":
             output.append(f"{indent_text}1. {content}\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent + 3))
+                output.append(render_blocks(children, asset_dir, indent + 3, toc_markdown))
 
         elif block_type == "to_do":
             checked = "x" if data.get("checked") else " "
             output.append(f"{indent_text}- [{checked}] {content}\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent + 2))
+                output.append(render_blocks(children, asset_dir, indent + 2, toc_markdown))
 
         elif block_type == "toggle":
             output.append(f"{indent_text}<details>\n{indent_text}<summary>{content or '자세히 보기'}</summary>\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown))
             output.append(f"{indent_text}</details>\n\n")
 
         elif block_type == "quote":
@@ -578,7 +619,7 @@ def render_blocks(
             quote_lines = (content or " ").splitlines() or [" "]
             output.append("\n".join(f"{indent_text}> {icon} {line}" for line in quote_lines) + "\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown))
 
         elif block_type == "code":
             language = data.get("language", "text")
@@ -621,7 +662,7 @@ def render_blocks(
 
         elif block_type in {"column_list", "column", "synced_block"}:
             if children:
-                output.append(render_blocks(children, asset_dir, indent))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown))
                 if block_type in {"column", "column_list"}:
                     output.append("\n")
 
@@ -635,7 +676,7 @@ def render_blocks(
             child_url = f"https://www.notion.so/{block.get('id', '').replace('-', '')}"
             output.append(f"[📄 {child_title}]({child_url})\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown))
 
         elif block_type == "child_database":
             db_title = data.get("title", "하위 데이터베이스")
@@ -650,21 +691,25 @@ def render_blocks(
         elif block_type == "divider":
             output.append("---\n\n")
 
-        elif block_type in {"table_of_contents", "breadcrumb", "table_row"}:
-            # Notion 목차 블록은 위에서 heading을 수집해 GitHub용 목차로 다시 생성합니다.
+        elif block_type == "table_of_contents":
+            # Notion에 목차 블록을 직접 삽입한 경우에만 이 위치에 목차를 표시합니다.
+            if toc_markdown:
+                output.append(toc_markdown)
+
+        elif block_type in {"breadcrumb", "table_row"}:
             continue
 
         elif block_type == "template":
             if content:
                 output.append(f"{indent_text}{content}\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown))
 
         else:
             # 알 수 없는 블록이라도 완전히 조용히 버리지 않고 유형을 기록합니다.
             output.append(f"<!-- Notion block type not yet converted: {block_type or 'unknown'} -->\n\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent))
+                output.append(render_blocks(children, asset_dir, indent, toc_markdown))
 
     return "".join(output)
 
@@ -689,21 +734,22 @@ def save_as_markdown(page: Dict[str, Any], date_str: str) -> Tuple[str, Path]:
     log(f">> [INFO] Notion 블록 조회: {title}")
     blocks = load_block_tree(get_page_blocks(page_id))
 
-    # Markdown 문서에 먼저 출력되는 페이지 제목과 목차 제목도
-    # GitHub의 중복 anchor 번호 계산에 포함합니다.
-    used_slugs: Dict[str, int] = {}
-    for initial_heading in (title, re.sub(r"^#+\s*", "", TOC_TITLE)):
-        if initial_heading:
-            initial_slug = github_slug(initial_heading)
-            used_slugs[initial_slug] = used_slugs.get(initial_slug, 0) + 1
-    headings = collect_headings(blocks, used_slugs)
+    # 목차는 사용자가 Notion 페이지에 삽입한 경우에만 생성합니다.
+    # GitHub에는 Notion의 동적 목차 위젯이 없으므로, 해당 블록 위치에
+    # 같은 페이지의 제목들을 가리키는 Markdown 링크 목록을 렌더링합니다.
+    toc_markdown = ""
+    if contains_table_of_contents(blocks):
+        used_slugs: Dict[str, int] = {}
+        title_slug = github_slug(title)
+        used_slugs[title_slug] = used_slugs.get(title_slug, 0) + 1
+        headings = collect_headings(blocks, used_slugs)
+        toc_markdown = build_table_of_contents(headings)
 
     markdown_content = f"# {title}\n\n"
     markdown_content += f"> 날짜: {date_str}\n"
     markdown_content += f"> 원본 노션: [링크]({page.get('url', '')})\n\n"
     markdown_content += "---\n\n"
-    markdown_content += build_table_of_contents(headings)
-    markdown_content += render_blocks(blocks, asset_dir)
+    markdown_content += render_blocks(blocks, asset_dir, toc_markdown=toc_markdown)
 
     # 반복 배포 시 오래된 파일이 남지 않도록 빈 자산 폴더는 만들지 않습니다.
     filename.write_text(markdown_content.rstrip() + "\n", encoding="utf-8")
