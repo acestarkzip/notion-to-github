@@ -282,13 +282,48 @@ def sanitize_filename(name: str) -> str:
 
 
 def github_slug(text: str) -> str:
-    """GitHub heading anchor에 가까운 slug를 생성합니다(한글 포함)."""
-    value = unicodedata.normalize("NFKC", text).lower().strip()
-    value = re.sub(r"[^\w\- ]", "", value, flags=re.UNICODE)
-    value = value.replace("_", "")  # GitHub 섹션 앵커 규칙에 맞춰 문장부호 제거
-    value = re.sub(r"\s+", "-", value)
-    value = re.sub(r"-+", "-", value).strip("-")
-    return value or "section"
+    """GitHub Markdown heading의 자동 anchor 규칙에 맞춰 slug를 만듭니다.
+
+    GitHub 문서의 규칙을 따릅니다.
+    - 소문자로 변환
+    - 공백은 하이픈으로 치환
+    - 문장부호와 Markdown 서식 문자는 제거
+    - 한글/일본어/중국어/그리스어 등 Unicode 글자와 숫자는 보존
+
+    중복 제목의 -1, -2 접미사는 collect_headings()에서 처리합니다.
+    """
+    value = unicodedata.normalize("NFC", str(text or "")).lower().strip()
+    pieces: List[str] = []
+    pending_space = False
+
+    for char in value:
+        category = unicodedata.category(char)
+        if char.isspace():
+            pending_space = bool(pieces)
+            continue
+
+        # GitHub retains literal hyphens in headings. Other punctuation,
+        # symbols (including emoji), and formatting marks are excluded.
+        if char == "-":
+            if pending_space and pieces and pieces[-1] != "-":
+                pieces.append("-")
+            pieces.append("-")
+            pending_space = False
+            continue
+
+        if category[0] in {"L", "N", "M"}:
+            if pending_space and pieces and pieces[-1] != "-":
+                pieces.append("-")
+            pieces.append(char)
+            pending_space = False
+        else:
+            # Ignore punctuation/symbols. A following space is still handled
+            # normally, so "A. Linux" becomes "a-linux".
+            continue
+
+    slug = "".join(pieces)
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    return slug or "section"
 
 
 def get_title_from_page(page: Dict[str, Any]) -> str:
@@ -496,10 +531,11 @@ def collect_headings(
 
 
 def build_table_of_contents(headings: List[Dict[str, Any]]) -> str:
-    """Notion table_of_contents 블록 위치에 넣을 GitHub용 목차를 만듭니다.
+    """Notion의 table_of_contents 블록 위치에 클릭 가능한 GitHub 목차를 만듭니다.
 
-    목차 블록이 실제 Notion 페이지에 존재할 때만 호출합니다.
-    별도의 제목이나 구분선은 추가하지 않아 Notion 페이지의 배치를 최대한 유지합니다.
+    실제 Notion 목차 블록이 존재할 때만 호출합니다. 각 링크의 fragment는
+    같은 문서의 heading_1~3에 대해 GitHub가 자동 생성하는 anchor와 맞춥니다.
+    페이지 제목(# 제목)도 anchor 중복 계산에 포함됩니다.
     """
     if not headings:
         return ""
@@ -507,8 +543,10 @@ def build_table_of_contents(headings: List[Dict[str, Any]]) -> str:
     min_level = min(item["level"] for item in headings)
     lines: List[str] = []
     for item in headings:
-        indent = "  " * max(0, item["level"] - min_level)
-        lines.append(f"{indent}- [{item['title']}](#{item['slug']})")
+        indent = "  " * max(0, int(item["level"]) - min_level)
+        # Escape Markdown link-label brackets without changing visible title text.
+        label = str(item["title"]).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+        lines.append(f"{indent}- [{label}](#{item['slug']})")
     return "\n".join(lines) + "\n\n"
 
 
@@ -812,11 +850,16 @@ def save_as_markdown(page: Dict[str, Any], date_str: str) -> Tuple[str, Path]:
     # 같은 페이지의 제목들을 가리키는 Markdown 링크 목록을 렌더링합니다.
     toc_markdown = ""
     if contains_table_of_contents(blocks):
-        used_slugs: Dict[str, int] = {}
-        title_slug = github_slug(title)
-        used_slugs[title_slug] = used_slugs.get(title_slug, 0) + 1
+        # GitHub treats the file title (# {title}) as the first heading when
+        # assigning section anchors, so reserve its slug before scanning body headings.
+        used_slugs: Dict[str, int] = {github_slug(title): 1}
         headings = collect_headings(blocks, used_slugs)
         toc_markdown = build_table_of_contents(headings)
+        log(f">> [INFO] Notion 목차 블록 감지: GitHub 링크 {len(headings)}개 생성")
+        if not headings:
+            log(">> [WARN] 목차 블록은 있지만 H1~H3 제목을 찾지 못했습니다.")
+    else:
+        log(">> [INFO] Notion 목차 블록이 없어 GitHub 목차를 추가하지 않습니다.")
 
     markdown_content = f"# {title}\n\n"
     markdown_content += f"> 날짜: {date_str}\n"
