@@ -32,11 +32,12 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.01-kst-twice-daily-today-yesterday-week-month-all-02"
+EXPORTER_VERSION = "2026.11.01-kst-twice-daily-today-yesterday-week-month-all-03-memo"
 
 SAVE_DIR_ROOT = Path("TIL")
 NOTION_PROPERTY_TITLE = "제목"
 NOTION_PROPERTY_DATE = "날짜"
+NOTION_PROPERTY_MEMO = "간단메모"
 README_FILE = Path("README.md")
 TIMEZONE_HOURS = 9
 
@@ -332,6 +333,25 @@ def get_page_date(page: Dict[str, Any]) -> Optional[str]:
     date_value = date_property.get("date") or {}
     start = date_value.get("start")
     return str(start)[:10] if start else None
+
+
+def get_page_memo(page: Dict[str, Any]) -> str:
+    """Notion 데이터베이스의 '간단메모' 텍스트 속성을 읽습니다.
+
+    일반 텍스트(rich_text)를 기본으로 읽고, title 형식으로 설정된 경우도
+    호환되도록 처리합니다. README 한 줄 목록을 위해 줄바꿈은 공백으로 정리합니다.
+    """
+    properties = page.get("properties", {}) or {}
+    memo_property = properties.get(NOTION_PROPERTY_MEMO, {}) or {}
+    if not isinstance(memo_property, dict):
+        return ""
+
+    memo_items = memo_property.get("rich_text")
+    if memo_items is None:
+        memo_items = memo_property.get("title", [])
+
+    memo = plain_text(memo_items)
+    return re.sub(r"\s+", " ", memo).strip()
 
 
 # =======================================================
@@ -1167,8 +1187,12 @@ def save_as_markdown(page: Dict[str, Any], date_str: str) -> Tuple[str, Path]:
     else:
         log(">> [INFO] Notion 목차 블록이 없어 GitHub 목차를 추가하지 않습니다.")
 
+    memo = get_page_memo(page)
+
     markdown_content = f"# {title}\n\n"
     markdown_content += f"> 날짜: {date_str}\n"
+    if memo:
+        markdown_content += f"> 간단메모: {memo}\n"
     markdown_content += f"> 원본 노션: [링크]({page.get('url', '')})\n\n"
     markdown_content += "---\n\n"
     markdown_content += render_blocks(
@@ -1203,6 +1227,18 @@ def extract_markdown_title(path: Path) -> str:
     return path.stem[11:].replace("_", " ") if len(path.stem) > 11 else path.stem
 
 
+def extract_markdown_memo(path: Path) -> str:
+    """내보낸 Markdown 파일의 Notion 간단메모 메타정보를 읽습니다."""
+    prefix = "> 간단메모:"
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith(prefix):
+                return line[len(prefix):].strip()
+    except OSError:
+        pass
+    return ""
+
+
 def update_main_readme_by_scanning(reset_mode: str) -> None:
     if not SAVE_DIR_ROOT.exists():
         log(">> [INFO] TIL 디렉터리가 없어 README 목록을 갱신하지 않습니다.")
@@ -1220,6 +1256,7 @@ def update_main_readme_by_scanning(reset_mode: str) -> None:
             "date": date_obj,
             "date_str": date_str,
             "title": extract_markdown_title(path),
+            "memo": extract_markdown_memo(path),
             "path": path,
         })
 
@@ -1236,7 +1273,10 @@ def update_main_readme_by_scanning(reset_mode: str) -> None:
         for item in items:
             relative_path = item["path"].as_posix()
             safe_path = quote(relative_path, safe="/._-")
-            lines.append(f"- [{item['date_str']} : {item['title']}](./{safe_path})")
+            entry = f"- [{item['date_str']} : {item['title']}](./{safe_path})"
+            if item["memo"]:
+                entry += f" — {item['memo']}"
+            lines.append(entry)
 
         month_content = "\n".join(lines) + "\n"
         if index == 0:
