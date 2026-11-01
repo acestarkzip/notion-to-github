@@ -32,7 +32,7 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.01-kst-twice-daily-today-yesterday-week-month-all-03-memo"
+EXPORTER_VERSION = "2026.11.01-kst-twice-daily-today-yesterday-week-month-all-04-memo-metadata-list"
 
 SAVE_DIR_ROOT = Path("TIL")
 NOTION_PROPERTY_TITLE = "제목"
@@ -1190,10 +1190,11 @@ def save_as_markdown(page: Dict[str, Any], date_str: str) -> Tuple[str, Path]:
     memo = get_page_memo(page)
 
     markdown_content = f"# {title}\n\n"
-    markdown_content += f"> 날짜: {date_str}\n"
-    if memo:
-        markdown_content += f"> 간단메모: {memo}\n"
-    markdown_content += f"> 원본 노션: [링크]({page.get('url', '')})\n\n"
+    # 메타정보를 한 줄로 붙이지 않고, 인용문 안의 3개 항목 목록으로 표시합니다.
+    # 메모가 비어 있어도 항목은 유지해 모든 문서의 형식을 통일합니다.
+    markdown_content += f"> - **날짜 :** {date_str}\n"
+    markdown_content += f"> - **간단메모 :** {memo}\n"
+    markdown_content += f"> - **원본 노션 :** [바로가기 링크]({page.get('url', '')})\n\n"
     markdown_content += "---\n\n"
     markdown_content += render_blocks(
         blocks,
@@ -1228,12 +1229,19 @@ def extract_markdown_title(path: Path) -> str:
 
 
 def extract_markdown_memo(path: Path) -> str:
-    """내보낸 Markdown 파일의 Notion 간단메모 메타정보를 읽습니다."""
-    prefix = "> 간단메모:"
+    """새 형식과 기존 형식의 Markdown에서 Notion 간단메모를 읽습니다."""
     try:
         for line in path.read_text(encoding="utf-8").splitlines():
-            if line.startswith(prefix):
-                return line[len(prefix):].strip()
+            # 새 형식: > - **간단메모 :** 내용
+            match = re.match(r"^>\s*-\s*\*\*간단메모\s*:\*\*\s*(.*)$", line)
+            if match:
+                return match.group(1).strip()
+
+            # 이전 버전으로 생성된 Markdown도 계속 읽을 수 있도록 호환합니다.
+            legacy_prefixes = ("> 간단메모:", "> 간단메모 :")
+            for prefix in legacy_prefixes:
+                if line.startswith(prefix):
+                    return line[len(prefix):].strip()
     except OSError:
         pass
     return ""
