@@ -172,7 +172,6 @@ jobs:
       # 2) 목적지 Pages 저장소를 별도 폴더에 checkout합니다.
       # SSH_DEPLOY_KEY는 acestarkzip.github.io 저장소에 등록된 쓰기 권한 Deploy Key여야 합니다.
       - name: Checkout GitHub Pages repository
-        if: steps.output.outputs.has_posts == 'true'
         uses: actions/checkout@v7
         with:
           repository: acestarkzip/acestarkzip.github.io
@@ -181,6 +180,29 @@ jobs:
           ssh-key: ${{ secrets.SSH_DEPLOY_KEY }}
           fetch-depth: 0
           persist-credentials: true
+
+      # 기존 Pages Markdown 목록을 항상 기록합니다.
+      # 오늘 조회 결과가 0건이어도 기존 TIL만으로 blog-index.json을 재생성할 수 있습니다.
+      - name: Record existing Markdown before optional merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          repo = Path("pages-site")
+          manifest = Path(os.environ["RUNNER_TEMP"]) / "existing-markdown-before.json"
+          paths = []
+          for path in repo.rglob("*.md"):
+              relative = path.relative_to(repo)
+              if ".git" not in relative.parts:
+                  paths.append(relative.as_posix())
+          paths.sort()
+          manifest.write_text(json.dumps(paths, ensure_ascii=False, indent=2), encoding="utf-8")
+          print(f"기존 Markdown 보호 목록 기록: {len(paths)}개")
+          PY
 
       # 3) 목적지에 이미 있던 모든 Markdown 경로를 기록하고,
       # TIL을 삭제 없이 병합합니다. 기존 수동 작성 Markdown과 경로가 충돌하면
@@ -400,7 +422,6 @@ jobs:
       # 오래된 Markdown 파일은 저장소에 보존하되, 같은 Notion 페이지의 이전 제목/경로는
       # blog-index.json에서 최신 버전 하나만 노출합니다.
       - name: Build canonical blog index (deduplicate by Notion page ID)
-        if: steps.output.outputs.has_posts == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -522,7 +543,6 @@ jobs:
 
       # 5) TIL과 blog-index.json만 스테이징합니다. README.md, index.html, blog/, images/ 등은 건드리지 않습니다.
       - name: Stage TIL changes and reject deletions
-        if: steps.output.outputs.has_posts == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -551,7 +571,6 @@ jobs:
 
       # 6) 원격 변경을 rebase한 뒤에도 실행 시작 시 존재했던 Markdown이 모두 남아 있는지 재검사합니다.
       - name: Commit and push safely
-        if: steps.output.outputs.has_posts == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -596,5 +615,6 @@ jobs:
         if: always()
         run: |
           echo "Notion → GitHub Pages 안전 병합 작업이 종료되었습니다."
+          echo "Notion 새 기록이 없어도 기존 Pages TIL을 기준으로 blog-index.json을 재생성합니다."
           echo "기존 파일은 삭제하지 않으며 수동 작성 Markdown과 경로가 충돌하면 __notion 별도 파일로 보존합니다."
           echo "기존 파일 삭제 방식(cpina push-to-another-repository)은 사용하지 않습니다."
