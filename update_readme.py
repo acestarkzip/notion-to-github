@@ -32,7 +32,7 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.01-kst-twice-daily-today-yesterday-week-month-all-04-memo-metadata-list"
+EXPORTER_VERSION = "2026.11.02-notion-page-id-canonical-blog-index-01"
 
 SAVE_DIR_ROOT = Path("TIL")
 NOTION_PROPERTY_TITLE = "제목"
@@ -1189,9 +1189,17 @@ def save_as_markdown(page: Dict[str, Any], date_str: str) -> Tuple[str, Path]:
 
     memo = get_page_memo(page)
 
-    markdown_content = f"# {title}\n\n"
-    # 메타정보를 한 줄로 붙이지 않고, 인용문 안의 3개 항목 목록으로 표시합니다.
-    # 메모가 비어 있어도 항목은 유지해 모든 문서의 형식을 통일합니다.
+    # Invisible metadata lets the deployment workflow and public blog identify
+    # this Notion page even when its title/date changes and a new .md path is created.
+    normalized_page_id = re.sub(r"[^0-9a-fA-F]", "", str(page_id)).lower()
+    last_edited_time = str(page.get("last_edited_time") or "")
+    markdown_content = (
+        "<!-- notion-to-github-managed -->\n"
+        f"<!-- notion-page-id: {normalized_page_id} -->\n"
+        f"<!-- notion-last-edited-time: {last_edited_time} -->\n\n"
+        f"# {title}\n\n"
+    )
+    # 메타정보를 인용문 안의 목록으로 표시합니다. 메모가 비어 있어도 항목은 유지합니다.
     markdown_content += f"> - **날짜 :** {date_str}\n"
     markdown_content += f"> - **간단메모 :** {memo}\n"
     markdown_content += f"> - **원본 노션 :** [바로가기 링크]({page.get('url', '')})\n\n"
