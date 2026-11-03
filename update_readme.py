@@ -16,6 +16,7 @@ so that the existing /v1/databases/{id}/query workflow remains compatible.
 from __future__ import annotations
 
 import hashlib
+import json
 import mimetypes
 import os
 import re
@@ -32,9 +33,10 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.02-notion-page-id-canonical-blog-index-01"
+EXPORTER_VERSION = "2026.11.03-notion-authoritative-index-v2"
 
 SAVE_DIR_ROOT = Path("TIL")
+ACTIVE_PAGES_MANIFEST = Path("notion-active-pages.json")
 NOTION_PROPERTY_TITLE = "제목"
 NOTION_PROPERTY_DATE = "날짜"
 NOTION_PROPERTY_MEMO = "간단메모"
@@ -1431,6 +1433,58 @@ def query_database(fetch_mode: str) -> List[Dict[str, Any]]:
     return get_paginated_results(url, method="POST", payload=payload)
 
 
+
+def write_active_pages_manifest(pages: List[Dict[str, Any]], fetch_mode: str) -> None:
+    """Write a complete, authoritative snapshot of currently active Notion database pages.
+
+    The selected FETCH_MODE controls which page bodies are exported to Markdown. This
+    manifest is deliberately built from an ALL database query on every run so deletions
+    in Notion disappear from the public blog index without deleting archived Markdown.
+    """
+    active_pages: List[Dict[str, Any]] = []
+    seen_ids = set()
+
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        if page.get("archived") is True or page.get("in_trash") is True:
+            continue
+
+        raw_id = str(page.get("id") or "")
+        page_id = re.sub(r"[^0-9a-fA-F]", "", raw_id).lower()
+        if not page_id or page_id in seen_ids:
+            continue
+        seen_ids.add(page_id)
+
+        page_date = get_page_date(page) or ""
+        # Pages without a date cannot be placed in the dated TIL archive, but keep them
+        # in the manifest for diagnostics; the public index builder will omit them.
+        active_pages.append({
+            "notion_page_id": page_id,
+            "title": get_title_from_page(page),
+            "date": page_date,
+            "memo": get_page_memo(page),
+            "url": str(page.get("url") or ""),
+            "last_edited_time": str(page.get("last_edited_time") or ""),
+        })
+
+    payload = {
+        "schema_version": 1,
+        "source_of_truth": "notion_database",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "fetch_mode": str(fetch_mode or "").upper(),
+        "total_page_count": len(active_pages),
+        "dated_page_count": sum(1 for item in active_pages if item["date"]),
+        "pages": active_pages,
+    }
+    temporary = ACTIVE_PAGES_MANIFEST.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(ACTIVE_PAGES_MANIFEST)
+    log(
+        f">> [NOTION MANIFEST] 현재 활성 페이지 {len(active_pages)}개, "
+        f"날짜 있는 페이지 {payload['dated_page_count']}개 → {ACTIVE_PAGES_MANIFEST}"
+    )
+
 def main() -> None:
     global NOTION_TOKEN, DATABASE_ID, HEADERS
 
@@ -1462,8 +1516,33 @@ def main() -> None:
             "TODAY, YESTERDAY, WEEK, MONTH, ALL 중 하나를 사용하세요."
         )
 
+    # Selected mode controls Markdown body export. The public index always uses a full,
+    # fresh Notion database snapshot so deleted Notion pages disappear from the blog.
     pages = query_database(fetch_mode)
-    log(f">> [INFO] 조회된 Notion 페이지: {len(pages)}개")
+    log(f">> [INFO] 선택 범위({fetch_mode}) 조회된 Notion 페이지: {len(pages)}개")
+
+    all_pages = pages if fetch_mode == "ALL" else query_database("ALL")
+    log(f">> [INFO] 전체 Notion 데이터베이스 활성 페이지 조회: {len(all_pages)}개")
+
+    # Refuse to publish a possibly incomplete/empty authority snapshot if the selected
+    # query returned records but the subsequent full-database query did not contain them.
+    all_ids = {
+        re.sub(r"[^0-9a-fA-F]", "", str(item.get("id") or "")).lower()
+        for item in all_pages if isinstance(item, dict)
+    }
+    missing_selected_ids = [
+        str(item.get("id") or "") for item in pages
+        if isinstance(item, dict)
+        and re.sub(r"[^0-9a-fA-F]", "", str(item.get("id") or "")).lower() not in all_ids
+    ]
+    if missing_selected_ids:
+        raise RuntimeError(
+            "전체 Notion 조회 결과가 선택 범위 조회와 일치하지 않습니다. "
+            "안전한 동기화를 위해 manifest 생성을 중단합니다. 누락 ID: "
+            + ", ".join(missing_selected_ids[:10])
+        )
+
+    write_active_pages_manifest(all_pages, fetch_mode)
 
     for page in pages:
         page_date = get_page_date(page)
