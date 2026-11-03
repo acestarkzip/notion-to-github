@@ -418,10 +418,9 @@ jobs:
           print("기존 Markdown은 삭제하지 않았습니다. 변경된 페이지에서 더 이상 참조되지 않는 기존 미디어만 정리했습니다.")
           PY
 
-      # 4) 전체 TIL에서 Notion 페이지 ID 기준의 최신 게시글 목록을 생성합니다.
-      # 오래된 Markdown 파일은 저장소에 보존하되, 같은 Notion 페이지의 이전 제목/경로는
-      # blog-index.json에서 최신 버전 하나만 노출합니다.
-      - name: Build canonical blog index (deduplicate by Notion page ID)
+      # 4) Notion 전체 데이터베이스 스냅샷을 기준으로 공개 게시글 목록을 생성합니다.
+      # 삭제된 Notion 페이지의 Markdown은 보존하지만 blog-index.json에서는 제외합니다.
+      - name: Build canonical blog index (Notion is source of truth)
         shell: bash
         run: |
           set -euo pipefail
@@ -432,113 +431,139 @@ jobs:
           from pathlib import Path
           from urllib.parse import unquote
 
+          manifest_path = Path("notion-active-pages.json")
+          if not manifest_path.is_file():
+              raise SystemExit("[ERROR] Notion 전체 페이지 manifest가 없습니다. 공개 색인을 갱신하지 않습니다.")
+
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          if manifest.get("source_of_truth") != "notion_database" or not isinstance(manifest.get("pages"), list):
+              raise SystemExit("[ERROR] Notion manifest 형식/출처가 올바르지 않습니다. 기존 blog-index.json을 보존합니다.")
+
+          def norm_id(value):
+              return re.sub(r"[^0-9a-fA-F]", "", str(value or "")).lower()
+
+          active_pages = {}
+          for item in manifest["pages"]:
+              page_id = norm_id(item.get("notion_page_id"))
+              date_value = str(item.get("date") or "")[:10]
+              if not page_id:
+                  continue
+              if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_value):
+                  print(f"::warning::날짜가 없어 블로그 색인에서 제외: {item.get('title', '(제목 없음)')}")
+                  continue
+              active_pages[page_id] = {
+                  "notion_page_id": page_id,
+                  "title": str(item.get("title") or "Untitled note").strip() or "Untitled note",
+                  "date": date_value,
+                  "memo": str(item.get("memo") or "").strip(),
+                  "url": str(item.get("url") or ""),
+                  "last_edited_time": str(item.get("last_edited_time") or ""),
+              }
+
           til_root = Path("pages-site/TIL")
+          if not til_root.is_dir():
+              raise SystemExit("[ERROR] Pages 저장소에 TIL 폴더가 없습니다. 색인을 갱신하지 않습니다.")
+
           date_from_name = re.compile(r"^(\d{4}-\d{2}-\d{2})[_\s-]")
           page_marker = re.compile(r"<!--\s*notion-page-id:\s*([0-9a-fA-F-]{32,36})\s*-->", re.I)
           edited_marker = re.compile(r"<!--\s*notion-last-edited-time:\s*([^>]+?)\s*-->", re.I)
           uuid_pattern = re.compile(r"(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
-          memo_pattern = re.compile(r"^\s*>\s*(?:-\s*)?\*{0,2}\s*간단메모\s*:\s*\*{0,2}\s*(.*?)\s*$")
-          date_meta_pattern = re.compile(r"^\s*>\s*(?:-\s*)?\*{0,2}\s*날짜\s*:\s*\*{0,2}\s*(\d{4}-\d{2}-\d{2})")
 
           def extract_identity(text):
-              marker = page_marker.search(text[:4000])
+              marker = page_marker.search(text[:5000])
               if marker:
-                  return marker.group(1).replace("-", "").lower()
-              for line in text.splitlines()[:30]:
+                  return norm_id(marker.group(1))
+              # Backward compatibility: older exported Markdown has the page ID in its
+              # original Notion URL instead of a dedicated HTML metadata marker.
+              for line in text.splitlines()[:40]:
                   if "원본 노션" not in line:
                       continue
                   for match in uuid_pattern.finditer(unquote(line)):
-                      return match.group(0).replace("-", "").lower()
+                      return norm_id(match.group(0))
               return ""
 
-          def parse_edited(text):
-              match = edited_marker.search(text[:4000])
+          def parse_timestamp(text):
+              match = edited_marker.search(text[:5000])
               if not match:
                   return 0.0
-              value = match.group(1).strip()
               try:
-                  parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                  if parsed.tzinfo is None:
-                      parsed = parsed.replace(tzinfo=timezone.utc)
-                  return parsed.timestamp()
+                  value = datetime.fromisoformat(match.group(1).strip().replace("Z", "+00:00"))
+                  if value.tzinfo is None:
+                      value = value.replace(tzinfo=timezone.utc)
+                  return value.timestamp()
               except ValueError:
                   return 0.0
 
-          def parse_post(path):
-              if not path.is_file() or path.suffix.lower() != ".md":
-                  return None
+          candidates = {}
+          scanned = 0
+          for path in til_root.rglob("*.md"):
               relative_parts = path.relative_to(til_root).parts
               if any(part.lower().endswith("_assets") for part in relative_parts):
-                  return None
-              match = date_from_name.match(path.name)
-              if not match:
-                  return None
+                  continue
+              if path.name.lower() == "readme.md":
+                  continue
+              if not date_from_name.match(path.name):
+                  continue
               try:
                   text = path.read_text(encoding="utf-8")
               except (OSError, UnicodeError):
                   print(f"::warning::Markdown 읽기 실패: {path}")
-                  return None
-
-              date_value = match.group(1)
-              title = ""
-              memo = ""
-              for line in text.splitlines()[:40]:
-                  if not title and line.startswith("# "):
-                      title = line[2:].strip()
-                  memo_match = memo_pattern.match(line)
-                  if memo_match:
-                      memo = memo_match.group(1).strip()
-                  date_match = date_meta_pattern.match(line)
-                  if date_match:
-                      date_value = date_match.group(1)
-              if not title:
-                  title = re.sub(r"^\d{4}-\d{2}-\d{2}[_\s-]", "", path.stem).replace("_", " ").strip()
-              page_id = extract_identity(text)
-              return {
-                  "path": path.relative_to(Path("pages-site")).as_posix(),
-                  "date": date_value,
-                  "title": title or "Untitled note",
-                  "memo": memo,
-                  "notion_page_id": page_id,
-                  "_edited": parse_edited(text),
-              }
-
-          # Same Notion page may exist under old and new filenames. Keep the newest
-          # Notion last_edited_time; use stable path ordering as a deterministic tie-breaker.
-          chosen = {}
-          scanned = 0
-          for path in til_root.rglob("*.md"):
-              if path.name.lower() == "readme.md" and any(p.lower().endswith("_assets") for p in path.relative_to(til_root).parts):
-                  continue
-              post = parse_post(path)
-              if not post:
                   continue
               scanned += 1
-              key = f"notion:{post['notion_page_id']}" if post["notion_page_id"] else f"path:{post['path']}"
-              score = (post["_edited"], post["date"], post["path"])
-              previous = chosen.get(key)
-              if previous is None or score > previous[0]:
-                  chosen[key] = (score, post)
+              page_id = extract_identity(text)
+              if not page_id or page_id not in active_pages:
+                  # This includes Markdown whose Notion page was deleted. Keep the file
+                  # in GitHub history/storage, but do not expose it in the public index.
+                  continue
+              score = (parse_timestamp(text), path.as_posix())
+              current = candidates.get(page_id)
+              if current is None or score > current[0]:
+                  candidates[page_id] = (score, path)
 
-          posts = [entry[1] for entry in chosen.values()]
-          posts.sort(key=lambda item: (item["date"], item["_edited"], item["path"]), reverse=True)
-          for post in posts:
-              post.pop("_edited", None)
+          posts = []
+          missing_markdown = []
+          for page_id, page in active_pages.items():
+              candidate = candidates.get(page_id)
+              if candidate is None:
+                  missing_markdown.append(page_id)
+                  continue
+              path = candidate[1]
+              posts.append({
+                  "path": path.relative_to(Path("pages-site")).as_posix(),
+                  # Title/date/memo come from the current Notion page properties, not
+                  # from an old Markdown filename or stale Markdown metadata.
+                  "date": page["date"],
+                  "title": page["title"],
+                  "memo": page["memo"],
+                  "notion_page_id": page_id,
+                  "notion_url": page["url"],
+              })
 
+          posts.sort(key=lambda item: (item["date"], item["title"].casefold(), item["notion_page_id"]), reverse=True)
           payload = {
-              "schema_version": 1,
-              "total_count": len(posts),
+              "schema_version": 2,
+              "source_of_truth": "notion_database",
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "active_notion_page_count": len(active_pages),
+              "matched_markdown_count": len(posts),
+              "missing_markdown_count": len(missing_markdown),
               "scanned_markdown_count": scanned,
+              "total_count": len(posts),
               "posts": posts,
           }
+
           target = til_root / "blog-index.json"
           target.parent.mkdir(parents=True, exist_ok=True)
           temporary = target.with_suffix(".json.tmp")
           temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
           temporary.replace(target)
-          print(f"[BLOG INDEX] Markdown 검사: {scanned}개")
-          print(f"[BLOG INDEX] Notion ID/경로 중복 제거 후 게시글: {len(posts)}개")
+
+          print(f"[BLOG INDEX] Notion 현재 페이지(날짜 있음): {len(active_pages)}개")
+          print(f"[BLOG INDEX] 연결된 Markdown: {len(posts)}개")
+          print(f"[BLOG INDEX] Markdown 없는 Notion 페이지: {len(missing_markdown)}개")
+          print(f"[BLOG INDEX] 스캔한 Markdown: {scanned}개")
           print(f"[BLOG INDEX] 생성 완료: {target}")
+          print("[BLOG INDEX] Notion에 없는 페이지의 Markdown은 삭제하지 않고 공개 목록에서만 제외했습니다.")
           PY
 
       # 5) TIL과 blog-index.json만 스테이징합니다. README.md, index.html, blog/, images/ 등은 건드리지 않습니다.
@@ -615,6 +640,6 @@ jobs:
         if: always()
         run: |
           echo "Notion → GitHub Pages 안전 병합 작업이 종료되었습니다."
-          echo "Notion 새 기록이 없어도 기존 Pages TIL을 기준으로 blog-index.json을 재생성합니다."
-          echo "기존 파일은 삭제하지 않으며 수동 작성 Markdown과 경로가 충돌하면 __notion 별도 파일로 보존합니다."
+          echo "Notion 전체 데이터베이스 manifest를 기준으로 blog-index.json을 재생성합니다."
+          echo "기존 Markdown/이미지는 보존하고, Notion에서 삭제된 페이지는 블로그 색인에서만 제외합니다."
           echo "기존 파일 삭제 방식(cpina push-to-another-repository)은 사용하지 않습니다."
