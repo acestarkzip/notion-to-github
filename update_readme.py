@@ -33,7 +33,7 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.06-last-edited-weekly-monthly-reconcile-v1"
+EXPORTER_VERSION = "2026.11.06-week-range-filter-fix-v2"
 
 SAVE_DIR_ROOT = Path("TIL")
 ACTIVE_PAGES_MANIFEST = Path("notion-active-pages.json")
@@ -140,6 +140,31 @@ def notion_request(method: str, url: str, **kwargs: Any) -> Dict[str, Any]:
 
             response.raise_for_status()
             return response.json()
+
+        except requests.HTTPError as exc:
+            # 400/401/403/404 등 요청 자체의 오류는 재시도해도 해결되지
+            # 않으므로 Notion이 반환한 상세 메시지를 출력하고 즉시 중단합니다.
+            response = getattr(exc, "response", None)
+            if response is not None:
+                try:
+                    error_payload = response.json()
+                    error_code = error_payload.get("code", "unknown")
+                    error_message = error_payload.get("message", response.text)
+                except (ValueError, AttributeError):
+                    error_code = "unknown"
+                    error_message = getattr(response, "text", str(exc))
+
+                log(
+                    f">> [NOTION API ERROR] HTTP {response.status_code} "
+                    f"({error_code}): {error_message}"
+                )
+
+                if 400 <= response.status_code < 500 and response.status_code != 429:
+                    raise
+
+            if attempt == MAX_API_RETRIES - 1:
+                raise
+            time.sleep(min(2 ** attempt, 15))
 
         except requests.RequestException:
             if attempt == MAX_API_RETRIES - 1:
@@ -1449,16 +1474,27 @@ def query_database(fetch_mode: str) -> List[Dict[str, Any]]:
             f"{start_date} ~ {end_date}"
         )
         if start_date == end_date:
-            date_filter = {"equals": start_date}
-        else:
-            date_filter = {
-                "on_or_after": start_date,
-                "on_or_before": end_date,
+            # 단일 날짜 조회는 하나의 date 조건으로 충분합니다.
+            payload["filter"] = {
+                "property": NOTION_PROPERTY_DATE,
+                "date": {"equals": start_date},
             }
-        payload["filter"] = {
-            "property": NOTION_PROPERTY_DATE,
-            "date": date_filter,
-        }
+        else:
+            # Notion API는 한 date 필터 안에 범위 연산자 두 개를 함께
+            # 넣는 대신, 각각의 필터를 compound AND로 연결해야 합니다.
+            # 이 형태는 WEEK / MONTH 범위 조회에서 HTTP 400을 방지합니다.
+            payload["filter"] = {
+                "and": [
+                    {
+                        "property": NOTION_PROPERTY_DATE,
+                        "date": {"on_or_after": start_date},
+                    },
+                    {
+                        "property": NOTION_PROPERTY_DATE,
+                        "date": {"on_or_before": end_date},
+                    },
+                ]
+            }
 
     return get_paginated_results(url, method="POST", payload=payload)
 
