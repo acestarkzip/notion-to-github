@@ -16,6 +16,7 @@ so that the existing /v1/databases/{id}/query workflow remains compatible.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import mimetypes
 import os
@@ -33,7 +34,7 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.06-week-range-filter-fix-v2"
+EXPORTER_VERSION = "2026.11.06-markdown-inline-format-fix-v1"
 
 SAVE_DIR_ROOT = Path("TIL")
 ACTIVE_PAGES_MANIFEST = Path("notion-active-pages.json")
@@ -286,13 +287,26 @@ def rich_text_to_markdown(
             # Inline code must stay inline; fenced blocks are reserved for Notion code blocks.
             value = inline_code_span(text_value)
         else:
-            value = text_value
+            # Notion returns adjacent rich-text runs separately. A bold run followed
+            # immediately by plain text can become invalid CommonMark, e.g.
+            # **bold text**Python. The closing ** is not considered a delimiter
+            # when followed directly by a letter, so GitHub Pages prints the asterisks.
+            # HTML emphasis tags preserve the exact no-space boundary and are supported
+            # by both GitHub Markdown and this site's Marked + DOMPurify renderer.
+            has_html_formatting = (
+                (preserve_bold and annotations.get("bold"))
+                or annotations.get("italic")
+                or annotations.get("strikethrough")
+                or annotations.get("underline")
+            )
+            value = html.escape(text_value, quote=False) if has_html_formatting else text_value
+
             if preserve_bold and annotations.get("bold"):
-                value = f"**{value}**"
+                value = f"<strong>{value}</strong>"
             if annotations.get("italic"):
-                value = f"*{value}*"
+                value = f"<em>{value}</em>"
             if annotations.get("strikethrough"):
-                value = f"~~{value}~~"
+                value = f"<del>{value}</del>"
             if annotations.get("underline"):
                 value = f"<u>{value}</u>"
 
