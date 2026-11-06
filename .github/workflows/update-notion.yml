@@ -2,11 +2,17 @@ name: Update Notion Log (Safe Overlay)
 
 on:
   schedule:
-    # 매일 한국 시간 19:07: 정각 혼잡을 피하고 오늘(TODAY) 작성된 문서를 동기화합니다.
+    # 매일 한국 시간 19:07: 오늘(TODAY) 날짜 속성의 문서 본문을 동기화합니다.
     - cron: '7 19 * * *'
       timezone: 'Asia/Seoul'
-    # 매일 한국 시간 07:07: 정각 혼잡을 피하고 전날(YESTERDAY) 작성된 문서를 다시 동기화합니다.
+    # 매일 한국 시간 07:07: 어제(YESTERDAY) 날짜 속성의 문서 본문을 동기화합니다.
     - cron: '7 7 * * *'
+      timezone: 'Asia/Seoul'
+    # 매주 일요일 20:17: 작성 날짜와 무관하게 최근 14일 내 수정된 페이지를 재수집합니다.
+    - cron: '17 20 * * 0'
+      timezone: 'Asia/Seoul'
+    # 매월 1일 20:37: 전체 Notion 페이지를 다시 내보내 누락된 과거 수정도 복구합니다.
+    - cron: '37 20 1 * *'
       timezone: 'Asia/Seoul'
   workflow_dispatch:
     inputs:
@@ -65,11 +71,9 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --upgrade pip requests
 
-      # 예약 시간에 따라 조회 날짜를 명시적으로 결정합니다.
-      # schedule의 timezone은 Asia/Seoul로 지정되어 있습니다.
-      # 19:07 KST 실행은 TODAY, 다음 날 07:07 KST 실행은 YESTERDAY입니다.
-      # GitHub가 이전 cron(예: 0 19 * * *)을 event.schedule에 전달하는 경우도 호환합니다.
-      # 수동 실행에서는 Today / Yesterday / Week / Month / ALL 선택값을 사용합니다.
+      # 예약 시간에 따라 조회 모드를 결정합니다.
+      # 일일 실행은 Notion '날짜' 속성 기준, 주간 실행은 last_edited_time 기준,
+      # 월간 실행은 ALL 전체 재동기화입니다. 수동 메뉴의 기존 의미는 변경하지 않습니다.
       - name: Resolve fetch mode (KST schedule and manual choice)
         id: fetch-mode
         shell: bash
@@ -93,6 +97,12 @@ jobs:
               '7 7 * * *'|'0 7 * * *'|'5 15 * * *')
                 FETCH_MODE="YESTERDAY"
                 ;;
+              '17 20 * * 0')
+                FETCH_MODE="EDITED_WEEK"
+                ;;
+              '37 20 1 * *')
+                FETCH_MODE="ALL"
+                ;;
               *)
                 # 분(minute)만 낡은 값으로 전달되는 경우를 대비합니다.
                 # 분 값은 무시하고, 예약 시간의 시(hour)로 TODAY/YESTERDAY를 구분합니다.
@@ -105,12 +115,13 @@ jobs:
                   echo "::warning::이전/변형 cron($NORMALIZED_CRON)을 07시 예약으로 인식해 YESTERDAY로 처리합니다."
                 else
                   echo "::error::지원하지 않는 예약 cron입니다: $NORMALIZED_CRON"
-                  echo "현재 지원: 19시=TODAY, 07시=YESTERDAY"
+                  echo "현재 지원: 매일 19시=TODAY, 매일 07시=YESTERDAY, 일요일 20:17=EDITED_WEEK, 매월 1일 20:37=ALL"
                   exit 1
                 fi
                 ;;
             esac
             echo ">> GitHub schedule payload: $NORMALIZED_CRON"
+            echo ">> 예약 실행 조회 기준: $FETCH_MODE"
           else
             case "${INPUT_FETCH_MODE,,}" in
               today) FETCH_MODE="TODAY" ;;
@@ -138,7 +149,8 @@ jobs:
           GITHUB_RAW_BASE_URL: https://raw.githubusercontent.com/acestarkzip/acestarkzip.github.io/main
         run: python update_readme.py
 
-      # 출력이 없으면 빈 데이터를 배포하지 않고 정상 종료합니다.
+      # 이번 실행에서 생성된 Markdown 수를 기록합니다.
+      # 변경 사항이 없더라도 전체 manifest 기반의 공개 색인 재생성은 계속 진행합니다.
       - name: Check generated TIL files
         id: output
         shell: bash
