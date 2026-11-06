@@ -5,7 +5,7 @@ Required environment variables:
     NOTION_DATABASE_ID    Database ID containing TIL pages
 
 Optional environment variables:
-    FETCH_MODE            TODAY, YESTERDAY, WEEK, MONTH, or ALL (default TODAY; DAILY is a legacy alias)
+    FETCH_MODE            TODAY, YESTERDAY, WEEK, MONTH, ALL, or internal EDITED_WEEK
     RESET_MODE            true / false (default false)
     GITHUB_RAW_BASE_URL   Raw URL base for the destination repository (optional)
 
@@ -33,7 +33,7 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.03-notion-authoritative-index-v2"
+EXPORTER_VERSION = "2026.11.06-last-edited-weekly-monthly-reconcile-v1"
 
 SAVE_DIR_ROOT = Path("TIL")
 ACTIVE_PAGES_MANIFEST = Path("notion-active-pages.json")
@@ -1396,6 +1396,33 @@ def date_range_for_fetch_mode(
     return start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
 
 
+def query_database_recently_edited(days: int = 14) -> List[Dict[str, Any]]:
+    """Return pages edited in the recent rolling window, regardless of their TIL date.
+
+    This is intentionally separate from Today/Yesterday/Week/Month, which continue to
+    filter by the user's Notion '날짜' property. A rolling 14-day window gives a weekly
+    schedule one missed-run overlap. The monthly ALL schedule remains the full backstop.
+    """
+    if days < 1:
+        raise ValueError("days must be at least 1")
+
+    url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
+    now_utc = datetime.now(timezone.utc)
+    edited_after = (now_utc - timedelta(days=days)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    payload: Dict[str, Any] = {
+        "page_size": 100,
+        "filter": {
+            "timestamp": "last_edited_time",
+            "last_edited_time": {"on_or_after": edited_after},
+        },
+    }
+    log(
+        f">> [모드: EDITED_WEEK] 최근 {days}일간 수정된 Notion 페이지를 조회합니다. "
+        f"기준 시각: {edited_after} (작성 날짜와 무관)"
+    )
+    return get_paginated_results(url, method="POST", payload=payload)
+
+
 def query_database(fetch_mode: str) -> List[Dict[str, Any]]:
     url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
     payload: Dict[str, Any] = {"page_size": 100}
@@ -1403,16 +1430,19 @@ def query_database(fetch_mode: str) -> List[Dict[str, Any]]:
     if mode == "DAILY":
         mode = "YESTERDAY"
 
+    if mode == "EDITED_WEEK":
+        return query_database_recently_edited(days=14)
+
     date_range = date_range_for_fetch_mode(mode)
     if date_range is None:
-        log(">> [모드: ALL] 모든 Notion 기록을 조회합니다.")
+        log(">> [모드: ALL] 모든 Notion 기록을 조회합니다. (월간 전체 재동기화 포함)")
     else:
         start_date, end_date = date_range
         descriptions = {
             "TODAY": "오늘",
             "YESTERDAY": "어제",
-            "WEEK": "최근 7일(오늘 포함)",
-            "MONTH": "이번 달(1일~오늘)",
+            "WEEK": "최근 7일(오늘 포함, 날짜 속성 기준)",
+            "MONTH": "이번 달(1일~오늘, 날짜 속성 기준)",
         }
         log(
             f">> [모드: {mode}] {descriptions[mode]} Notion 기록을 조회합니다: "
@@ -1510,10 +1540,12 @@ def main() -> None:
     # 기존 DAILY 값은 호환성을 위해 YESTERDAY로 해석합니다.
     if fetch_mode == "DAILY":
         fetch_mode = "YESTERDAY"
-    if fetch_mode not in {"TODAY", "YESTERDAY", "WEEK", "MONTH", "ALL"}:
+    # EDITED_WEEK은 Workflow의 주간 예약 전용 모드입니다.
+    # 수동 메뉴(Today/Yesterday/Week/Month/ALL)는 기존 날짜 속성 기준을 유지합니다.
+    if fetch_mode not in {"TODAY", "YESTERDAY", "WEEK", "MONTH", "ALL", "EDITED_WEEK"}:
         raise SystemExit(
             f"[ERROR] 잘못된 FETCH_MODE={fetch_mode!r}. "
-            "TODAY, YESTERDAY, WEEK, MONTH, ALL 중 하나를 사용하세요."
+            "TODAY, YESTERDAY, WEEK, MONTH, ALL 또는 내부 예약 모드 EDITED_WEEK 중 하나를 사용하세요."
         )
 
     # Selected mode controls Markdown body export. The public index always uses a full,
