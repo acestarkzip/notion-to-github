@@ -34,7 +34,7 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.06-markdown-inline-format-fix-v1"
+EXPORTER_VERSION = "2026.11.12-notion-tags-v1"
 
 SAVE_DIR_ROOT = Path("TIL")
 ACTIVE_PAGES_MANIFEST = Path("notion-active-pages.json")
@@ -393,6 +393,35 @@ def get_page_memo(page: Dict[str, Any]) -> str:
 
     memo = plain_text(memo_items)
     return re.sub(r"\s+", " ", memo).strip()
+
+
+def get_page_tags(page: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Notion 데이터베이스의 '태그' 다중 선택 속성을 읽습니다.
+
+    블로그 필터에서 태그 이름을 사용하고, 필요하면 Notion 색상도 활용할 수
+    있도록 name과 color를 함께 저장합니다.
+    """
+    properties = page.get("properties", {}) or {}
+    tag_property = properties.get("태그", {}) or {}
+    if not isinstance(tag_property, dict):
+        return []
+
+    # Notion Multi-select 속성은 API 응답에서 multi_select 배열로 반환됩니다.
+    selected_tags = tag_property.get("multi_select", []) or []
+    tags: List[Dict[str, str]] = []
+
+    for item in selected_tags:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        tags.append({
+            "name": name,
+            "color": str(item.get("color") or "default"),
+        })
+
+    return tags
 
 
 # =======================================================
@@ -1544,6 +1573,7 @@ def write_active_pages_manifest(pages: List[Dict[str, Any]], fetch_mode: str) ->
             "title": get_title_from_page(page),
             "date": page_date,
             "memo": get_page_memo(page),
+            "tags": get_page_tags(page),
             "url": str(page.get("url") or ""),
             "last_edited_time": str(page.get("last_edited_time") or ""),
         })
