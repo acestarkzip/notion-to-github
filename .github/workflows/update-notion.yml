@@ -468,6 +468,7 @@ jobs:
                   "title": str(item.get("title") or "Untitled note").strip() or "Untitled note",
                   "date": date_value,
                   "memo": str(item.get("memo") or "").strip(),
+                  "tags": item.get("tags", []) if isinstance(item.get("tags", []), list) else [],
                   "url": str(item.get("url") or ""),
                   "last_edited_time": str(item.get("last_edited_time") or ""),
               }
@@ -547,13 +548,14 @@ jobs:
                   "date": page["date"],
                   "title": page["title"],
                   "memo": page["memo"],
+                  "tags": page["tags"],
                   "notion_page_id": page_id,
                   "notion_url": page["url"],
               })
 
           posts.sort(key=lambda item: (item["date"], item["title"].casefold(), item["notion_page_id"]), reverse=True)
           payload = {
-              "schema_version": 2,
+              "schema_version": 3,
               "source_of_truth": "notion_database",
               "generated_at": datetime.now(timezone.utc).isoformat(),
               "active_notion_page_count": len(active_pages),
