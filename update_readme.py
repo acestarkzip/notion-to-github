@@ -34,7 +34,7 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.12-notion-tags-v1"
+EXPORTER_VERSION = "2026.11.15-callout-quote-html-v1"
 
 SAVE_DIR_ROOT = Path("TIL")
 ACTIVE_PAGES_MANIFEST = Path("notion-active-pages.json")
@@ -913,6 +913,280 @@ def render_table(block: Dict[str, Any]) -> str:
     return "\n".join(output) + "\n\n"
 
 
+# =======================================================
+# [Notion Callout / Quote -> HTML 변환]
+# =======================================================
+
+
+def safe_html_url(url: str) -> str:
+    """HTML href/src에 사용할 URL을 제한하고 속성 이스케이프를 적용합니다."""
+    value = str(url or "").strip()
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if parsed.scheme and parsed.scheme.lower() not in {"http", "https", "mailto"}:
+        return ""
+    return html.escape(value, quote=True)
+
+
+def rich_text_to_html(rich_text_list: Optional[List[Dict[str, Any]]]) -> str:
+    """Notion rich_text를 HTML 인라인 요소로 변환합니다.
+
+    Callout/Quote 내부는 HTML 컨테이너로 출력하므로 Markdown 문법에 의존하지 않습니다.
+    굵게, 기울임, 취소선, 밑줄, 인라인 코드 및 링크를 보존합니다.
+    """
+    output: List[str] = []
+    for item in rich_text_list or []:
+        if not isinstance(item, dict):
+            continue
+
+        text_data = item.get("text") if isinstance(item.get("text"), dict) else {}
+        raw_text = item.get("plain_text")
+        if raw_text is None:
+            raw_text = text_data.get("content", "")
+        if raw_text is None:
+            equation_data = item.get("equation")
+            raw_text = equation_data.get("expression", "") if isinstance(equation_data, dict) else ""
+        value = html.escape(str(raw_text or ""), quote=False).replace("\n", "<br>\n")
+        if not value:
+            continue
+
+        annotations = item.get("annotations", {}) or {}
+        if annotations.get("code"):
+            value = f"<code>{value}</code>"
+        else:
+            if annotations.get("bold"):
+                value = f"<strong>{value}</strong>"
+            if annotations.get("italic"):
+                value = f"<em>{value}</em>"
+            if annotations.get("strikethrough"):
+                value = f"<del>{value}</del>"
+            if annotations.get("underline"):
+                value = f"<u>{value}</u>"
+
+        link_data = text_data.get("link") if isinstance(text_data.get("link"), dict) else {}
+        href = safe_html_url(item.get("href") or link_data.get("url") or "")
+        if href:
+            value = f'<a href="{href}">{value}</a>'
+        output.append(value)
+
+    return "".join(output)
+
+
+def render_table_html(block: Dict[str, Any]) -> str:
+    """HTML 컨테이너 안에서도 표가 사라지지 않도록 Notion 표를 HTML로 출력합니다."""
+    rows = (block.get("_children", []) or [])
+    if not rows:
+        return ""
+
+    table_options = block.get("table", {}) or {}
+    has_column_header = bool(table_options.get("has_column_header"))
+    rendered_rows: List[str] = []
+    for row_index, row in enumerate(rows):
+        if row.get("type") != "table_row":
+            continue
+        cells = (row.get("table_row", {}) or {}).get("cells", [])
+        cell_tag = "th" if has_column_header and row_index == 0 else "td"
+        rendered_cells = "".join(
+            f'<{cell_tag} style="border:1px solid rgba(127,127,127,.35);padding:.5rem .65rem;text-align:left;vertical-align:top;">'
+            f'{rich_text_to_html(cell)}</{cell_tag}>'
+            for cell in cells
+        )
+        rendered_rows.append(f"<tr>{rendered_cells}</tr>")
+
+    if not rendered_rows:
+        return ""
+    return (
+        '<div style="max-width:100%;overflow-x:auto;margin:.75rem 0;">'
+        '<table style="width:100%;border-collapse:collapse;">'
+        + "".join(rendered_rows)
+        + "</table></div>\n"
+    )
+
+
+def render_media_block_html(
+    block: Dict[str, Any],
+    block_type: str,
+    asset_dir: Path,
+    asset_counter: List[int],
+) -> str:
+    """HTML 블록 내부의 이미지/파일도 유지합니다."""
+    data = block.get(block_type, {}) or {}
+    url, source_type = get_media_source(data)
+    caption = get_caption(data)
+    original_name = str(data.get("name") or "").strip()
+    title = caption or original_name or ("이미지" if block_type == "image" else f"{block_type.upper()} 파일")
+
+    local_path = None
+    if url and source_type in {"file", "external"} and block_type in {"image", "file", "pdf", "audio", "video"}:
+        asset_counter[0] += 1
+        local_path = download_notion_file(
+            url, block.get("id", ""), asset_dir, title,
+            asset_index=asset_counter[0], asset_kind=block_type,
+        )
+
+    target = local_path or url
+    safe_target = safe_html_url(target)
+    if not safe_target:
+        return f'<p>[파일을 가져오지 못했습니다: {html.escape(title)}]</p>\n'
+
+    if block_type == "image":
+        alt = html.escape(caption or title, quote=True)
+        click_url = github_raw_url_for_asset(asset_dir, local_path) if local_path else url
+        safe_click = safe_html_url(click_url) or safe_target
+        return (
+            '<p style="margin:.75rem 0;">'
+            f'<a href="{safe_click}"><img src="{safe_target}" alt="{alt}" '
+            'style="display:block;max-width:100%;height:auto;border-radius:8px;"></a>'
+            '</p>\n'
+        )
+
+    if block_type == "video" and url and youtube_video_id(url):
+        video_id = youtube_video_id(url)
+        thumbnail = safe_html_url(f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg")
+        return (
+            f'<p><a href="{safe_target}">'
+            f'<img src="{thumbnail}" alt="{html.escape(title, quote=True)}" '
+            'style="display:block;max-width:100%;height:auto;border-radius:8px;">'
+            f'{html.escape(title)}</a></p>\n'
+        )
+
+    label = "PDF 문서 열기" if block_type == "pdf" else title
+    return f'<p><a href="{safe_target}">📎 {html.escape(label)}</a></p>\n'
+
+
+def render_blocks_as_html(
+    blocks: Iterable[Dict[str, Any]],
+    asset_dir: Path,
+    asset_counter: Optional[List[int]] = None,
+    depth: int = 0,
+) -> str:
+    """Callout/Quote 내부의 하위 Notion 블록을 Markdown 손실 없이 HTML로 렌더링합니다."""
+    if depth > MAX_BLOCK_DEPTH:
+        return '<p><em>중첩 블록 깊이 제한으로 일부 내용을 생략했습니다.</em></p>\n'
+    if asset_counter is None:
+        asset_counter = [0]
+
+    items = list(blocks or [])
+    output: List[str] = []
+    index = 0
+    while index < len(items):
+        block = items[index]
+        block_type = block.get("type", "")
+        data = block.get(block_type, {}) or {}
+        rich = data.get("rich_text", []) or []
+        content = rich_text_to_html(rich)
+        children = block.get("_children", []) or []
+
+        # 연속된 목록 항목은 하나의 ul/ol로 묶고, 자식 블록은 해당 li 안에 유지합니다.
+        if block_type in {"bulleted_list_item", "numbered_list_item"}:
+            tag = "ul" if block_type == "bulleted_list_item" else "ol"
+            list_items: List[str] = []
+            while index < len(items) and items[index].get("type") == block_type:
+                list_block = items[index]
+                list_data = list_block.get(block_type, {}) or {}
+                list_content = rich_text_to_html(list_data.get("rich_text", []) or [])
+                nested = render_blocks_as_html(
+                    list_block.get("_children", []) or [], asset_dir, asset_counter, depth + 1
+                )
+                list_items.append(f"<li>{list_content}{nested}</li>")
+                index += 1
+            output.append(
+                f'<{tag} style="margin:.5rem 0 .75rem 1.5rem;padding-left:.6rem;">'
+                + "".join(list_items) + f"</{tag}>\n"
+            )
+            continue
+
+        if block_type == "paragraph":
+            if content.strip():
+                output.append(f'<p style="margin:.35rem 0 .75rem;">{content}</p>\n')
+            if children:
+                output.append(render_blocks_as_html(children, asset_dir, asset_counter, depth + 1))
+        elif block_type in {"heading_1", "heading_2", "heading_3", "heading_4", "heading_5", "heading_6"}:
+            level = int(block_type[-1])
+            output.append(f'<h{level} style="margin:1rem 0 .55rem;">{content}</h{level}>\n')
+            if children:
+                output.append(render_blocks_as_html(children, asset_dir, asset_counter, depth + 1))
+        elif block_type == "to_do":
+            checked = bool(data.get("checked"))
+            mark = "☑" if checked else "☐"
+            nested = render_blocks_as_html(children, asset_dir, asset_counter, depth + 1)
+            output.append(f'<div style="margin:.35rem 0;">{mark} {content}{nested}</div>\n')
+        elif block_type == "toggle":
+            summary = content or "자세히 보기"
+            nested = render_blocks_as_html(children, asset_dir, asset_counter, depth + 1)
+            output.append(f'<details style="margin:.5rem 0;"><summary>{summary}</summary>{nested}</details>\n')
+        elif block_type == "quote":
+            nested = render_blocks_as_html(children, asset_dir, asset_counter, depth + 1)
+            output.append(
+                '<blockquote class="notion-quote" style="margin:1rem 0 1.25rem;padding:.35rem 0 .35rem 1rem;'
+                'border-left:3px solid rgba(220,220,220,.72);color:inherit;">'
+                f'{f"<p style=\"margin:.25rem 0 .5rem;\">{content}</p>" if content else ""}{nested}</blockquote>\n'
+            )
+        elif block_type == "callout":
+            icon_data = data.get("icon", {}) or {}
+            icon = icon_data.get("emoji") or "💡"
+            nested = render_blocks_as_html(children, asset_dir, asset_counter, depth + 1)
+            header = (
+                f'<div style="display:flex;align-items:flex-start;gap:.65rem;">'
+                f'<span aria-hidden="true" style="flex:0 0 auto;">{html.escape(str(icon))}</span>'
+                f'<div style="min-width:0;flex:1;">{content}</div></div>'
+            ) if content else ""
+            output.append(
+                '<div class="notion-callout" style="display:block;margin:1.1rem 0;padding:1rem 1.25rem;'
+                'background:rgba(255,255,255,.075);border:1px solid rgba(255,255,255,.12);'
+                'border-left:4px solid #76b900;border-radius:10px;color:inherit;">'
+                f'{header}{nested}</div>\n'
+            )
+        elif block_type == "code":
+            language = normalize_github_language(data.get("language", "text"))
+            code_content = html.escape(plain_text(data.get("rich_text", [])))
+            output.append(
+                f'<pre style="overflow-x:auto;"><code class="language-{html.escape(language, quote=True)}">'
+                f'{code_content}</code></pre>\n'
+            )
+        elif block_type == "table":
+            output.append(render_table_html(block))
+        elif block_type in {"image", "file", "pdf", "audio", "video"}:
+            output.append(render_media_block_html(block, block_type, asset_dir, asset_counter))
+        elif block_type in {"embed", "bookmark", "link_preview"}:
+            url = data.get("url", "")
+            safe_url = safe_html_url(url)
+            label = get_caption(data) or ("외부 콘텐츠" if block_type == "embed" else url or "링크")
+            if safe_url:
+                output.append(f'<p><a href="{safe_url}">🔗 {html.escape(str(label))}</a></p>\n')
+        elif block_type == "equation":
+            expression = html.escape(str(data.get("expression", "")))
+            if expression:
+                output.append(f'<p>\\({expression}\\)</p>\n')
+        elif block_type == "divider":
+            output.append("<hr>\n")
+        elif block_type in {"column_list", "column", "synced_block", "template"}:
+            if children:
+                output.append(render_blocks_as_html(children, asset_dir, asset_counter, depth + 1))
+            elif content:
+                output.append(f'<p>{content}</p>\n')
+        elif block_type == "child_page":
+            child_title = data.get("title", "하위 페이지")
+            page_url = f"https://www.notion.so/{str(block.get('id', '')).replace('-', '')}"
+            output.append(f'<p><a href="{safe_html_url(page_url)}">📄 {html.escape(str(child_title))}</a></p>\n')
+        elif block_type == "link_to_page":
+            page_ref = data.get("page_id") or data.get("database_id") or ""
+            if page_ref:
+                page_url = f"https://www.notion.so/{str(page_ref).replace('-', '')}"
+                output.append(f'<p><a href="{safe_html_url(page_url)}">Notion 페이지 열기</a></p>\n')
+        else:
+            # 알 수 없는 유형이라도 하위 블록을 가능한 한 보존합니다.
+            if content:
+                output.append(f'<p>{content}</p>\n')
+            if children:
+                output.append(render_blocks_as_html(children, asset_dir, asset_counter, depth + 1))
+
+        index += 1
+
+    return "".join(output)
+
+
 def render_blocks(
     blocks: Iterable[Dict[str, Any]],
     asset_dir: Path,
@@ -1005,17 +1279,10 @@ def render_blocks(
                 output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
             output.append(f"{indent_text}</details>\n\n")
 
-        elif block_type == "quote":
-            quote_lines = (content or " ").splitlines() or [" "]
-            output.append("\n".join(f"{indent_text}> {line}" for line in quote_lines) + "\n\n")
-
-        elif block_type == "callout":
-            icon_data = data.get("icon", {}) or {}
-            icon = icon_data.get("emoji") or "💡"
-            quote_lines = (content or " ").splitlines() or [" "]
-            output.append("\n".join(f"{indent_text}> {icon} {line}" for line in quote_lines) + "\n\n")
-            if children:
-                output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
+        elif block_type in {"quote", "callout"}:
+            # 이 두 블록은 일반 Markdown 인용문으로 평탄화하지 않습니다.
+            # HTML wrapper 안에 하위 블록도 HTML로 출력하여 박스/인용 구조를 유지합니다.
+            output.append(render_blocks_as_html([block], asset_dir, asset_counter) + "\n")
 
         elif block_type == "code":
             # GitHub applies syntax highlighting based on this language identifier.
