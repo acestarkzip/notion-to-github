@@ -34,7 +34,7 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.15-callout-quote-html-v1"
+EXPORTER_VERSION = "2026.11.15-visual-fidelity-v2"
 
 SAVE_DIR_ROOT = Path("TIL")
 ACTIVE_PAGES_MANIFEST = Path("notion-active-pages.json")
@@ -257,15 +257,62 @@ def normalize_github_language(language: Optional[str]) -> str:
     return GITHUB_LANGUAGE_ALIASES.get(value, value.replace(" ", ""))
 
 
+# Notion rich-text color tokens -> dark-theme-friendly CSS.
+# Values are fixed constants; API-provided strings are never inserted into CSS directly.
+NOTION_TEXT_COLOR_HEX = {
+    "gray": "#B5B5B0",
+    "brown": "#D9AD95",
+    "orange": "#F2A66A",
+    "yellow": "#F0D27A",
+    "green": "#9BD39A",
+    "blue": "#8CC7E6",
+    "purple": "#C6A7E8",
+    "pink": "#E9A9CB",
+    "red": "#F08F89",
+}
+
+NOTION_BACKGROUND_COLOR_CSS = {
+    "default_background": "rgba(255,255,255,.10)",
+    "gray_background": "rgba(160,160,155,.20)",
+    "brown_background": "rgba(169,115,83,.22)",
+    "orange_background": "rgba(217,115,13,.22)",
+    "yellow_background": "rgba(203,145,47,.22)",
+    "green_background": "rgba(68,131,97,.25)",
+    "blue_background": "rgba(51,126,169,.24)",
+    "purple_background": "rgba(144,101,176,.24)",
+    "pink_background": "rgba(193,76,138,.24)",
+    "red_background": "rgba(212,76,71,.24)",
+}
+
+
+def notion_color_style(color: Optional[str]) -> str:
+    """Return a safe CSS declaration for a Notion color token."""
+    token = str(color or "default").strip().lower()
+    if token in NOTION_TEXT_COLOR_HEX:
+        return f"color:{NOTION_TEXT_COLOR_HEX[token]}"
+    if token in NOTION_BACKGROUND_COLOR_CSS:
+        return (
+            f"background-color:{NOTION_BACKGROUND_COLOR_CSS[token]};"
+            "border-radius:3px;padding:0 .15em;"
+            "-webkit-box-decoration-break:clone;box-decoration-break:clone"
+        )
+    return ""
+
+
+def rich_text_color_style(annotations: Dict[str, Any], default_color: Optional[str] = None) -> str:
+    """Prefer per-run color; fall back to the containing Notion block color."""
+    color = annotations.get("color")
+    if not color or color == "default":
+        color = default_color
+    return notion_color_style(color)
+
+
 def rich_text_to_markdown(
     rich_text_list: Optional[List[Dict[str, Any]]],
     preserve_bold: bool = True,
+    default_color: Optional[str] = None,
 ) -> str:
-    """Notion rich text를 Markdown으로 변환합니다.
-
-    preserve_bold=False이면 제목 블록처럼 Markdown 자체가 강조를 제공하는 곳에서
-    중복 ** 표시를 만들지 않습니다. 일반 문단에서는 기본값(True)으로 굵게를 유지합니다.
-    """
+    """Convert Notion rich_text to Markdown while preserving text/background colors."""
     output: List[str] = []
 
     for item in rich_text_list or []:
@@ -278,29 +325,31 @@ def rich_text_to_markdown(
         text_value = item.get("plain_text")
         if text_value is None:
             text_value = text_data.get("content", "")
+        if text_value is None:
+            equation_data = item.get("equation")
+            text_value = equation_data.get("expression", "") if isinstance(equation_data, dict) else ""
         text_value = str(text_value or "")
         if not text_value:
             continue
 
         annotations = item.get("annotations", {}) or {}
-        if annotations.get("code"):
-            # Inline code must stay inline; fenced blocks are reserved for Notion code blocks.
-            value = inline_code_span(text_value)
-        else:
-            # Notion returns adjacent rich-text runs separately. A bold run followed
-            # immediately by plain text can become invalid CommonMark, e.g.
-            # **bold text**Python. The closing ** is not considered a delimiter
-            # when followed directly by a letter, so GitHub Pages prints the asterisks.
-            # HTML emphasis tags preserve the exact no-space boundary and are supported
-            # by both GitHub Markdown and this site's Marked + DOMPurify renderer.
-            has_html_formatting = (
-                (preserve_bold and annotations.get("bold"))
-                or annotations.get("italic")
-                or annotations.get("strikethrough")
-                or annotations.get("underline")
-            )
-            value = html.escape(text_value, quote=False) if has_html_formatting else text_value
+        color_style = rich_text_color_style(annotations, default_color)
+        has_html_formatting = (
+            (preserve_bold and annotations.get("bold"))
+            or annotations.get("italic")
+            or annotations.get("strikethrough")
+            or annotations.get("underline")
+            or bool(color_style)
+        )
 
+        if annotations.get("code"):
+            # Use HTML code when colored, otherwise keep native Markdown code spans.
+            if color_style:
+                value = f"<code>{html.escape(text_value, quote=False)}</code>"
+            else:
+                value = inline_code_span(text_value)
+        else:
+            value = html.escape(text_value, quote=False) if has_html_formatting else text_value
             if preserve_bold and annotations.get("bold"):
                 value = f"<strong>{value}</strong>"
             if annotations.get("italic"):
@@ -310,16 +359,21 @@ def rich_text_to_markdown(
             if annotations.get("underline"):
                 value = f"<u>{value}</u>"
 
-        link_data = text_data.get("link")
-        if not isinstance(link_data, dict):
-            link_data = {}
+        if color_style:
+            value = f'<span style="{color_style}">{value}</span>'
+
+        link_data = text_data.get("link") if isinstance(text_data.get("link"), dict) else {}
         href = item.get("href") or link_data.get("url")
         if href:
-            # Markdown URL 괄호/공백을 안전하게 인코딩합니다.
-            href = str(href).replace("(", "%28").replace(")", "%29").replace(" ", "%20")
-            value = f"[{value}]({href})"
+            safe_href = safe_html_url(str(href))
+            if safe_href:
+                # HTML anchors safely preserve colored/annotated runs.
+                if color_style or has_html_formatting:
+                    value = f'<a href="{safe_href}">{value}</a>'
+                else:
+                    escaped_href = str(href).replace("(", "%28").replace(")", "%29").replace(" ", "%20")
+                    value = f"[{value}]({escaped_href})"
 
-        # Notion의 글자색/배경색은 GitHub Markdown에서 동일하게 재현되지 않아 텍스트는 유지합니다.
         output.append(value)
 
     return "".join(output)
@@ -856,17 +910,22 @@ def render_file_block(
         return f"> [파일을 가져오지 못했습니다: {title}]\n\n"
 
     if block_type == "image":
-        # alt text는 사용자가 넣은 캡션 또는 의미 있는 현재 섹션명을 사용합니다.
-        alt_text = (caption or title).replace("[", "\\[").replace("]", "\\]")
-        image_markdown = f"![{alt_text}]({target})"
+        # Render images at the full article width. The former Markdown syntax inherited
+        # the site's narrower generic image rule, leaving banners misaligned with callouts.
+        alt_text = html.escape(caption or title, quote=True)
+        safe_src = safe_html_url(target)
+        if not safe_src:
+            return f"<p>[이미지를 불러오지 못했습니다: {html.escape(title)}]</p>\n\n"
 
-        # 로컬 저장 이미지라면 클릭했을 때 GitHub blob 페이지가 아니라 raw 이미지가 열리게 합니다.
-        # 외부 URL 이미지라면 원본 URL 자체가 이미지 응답이므로 해당 URL로 연결합니다.
+        # Preserve the existing click-through behavior (raw URL for locally saved assets).
         click_url = github_raw_url_for_asset(asset_dir, local_path) if local_path else url
-        if click_url:
-            click_url = click_url.replace("(", "%28").replace(")", "%29").replace(" ", "%20")
-            return f"[{image_markdown}]({click_url})\n\n"
-        return image_markdown + "\n\n"
+        safe_click = safe_html_url(click_url) or safe_src
+        return (
+            '<p class="notion-image" style="box-sizing:border-box;width:100%;max-width:100%;margin:.75rem 0;">'
+            f'<a href="{safe_click}"><img src="{safe_src}" alt="{alt_text}" '
+            'style="display:block;width:100%;max-width:100%;height:auto;border-radius:8px;"></a>'
+            '</p>\n\n'
+        )
 
     label = "PDF 문서 열기" if block_type == "pdf" else title
     if block_type == "video" and url and youtube_video_id(url):
@@ -929,12 +988,11 @@ def safe_html_url(url: str) -> str:
     return html.escape(value, quote=True)
 
 
-def rich_text_to_html(rich_text_list: Optional[List[Dict[str, Any]]]) -> str:
-    """Notion rich_text를 HTML 인라인 요소로 변환합니다.
-
-    Callout/Quote 내부는 HTML 컨테이너로 출력하므로 Markdown 문법에 의존하지 않습니다.
-    굵게, 기울임, 취소선, 밑줄, 인라인 코드 및 링크를 보존합니다.
-    """
+def rich_text_to_html(
+    rich_text_list: Optional[List[Dict[str, Any]]],
+    default_color: Optional[str] = None,
+) -> str:
+    """Render Notion rich_text as safe HTML, including foreground/background colors."""
     output: List[str] = []
     for item in rich_text_list or []:
         if not isinstance(item, dict):
@@ -963,6 +1021,10 @@ def rich_text_to_html(rich_text_list: Optional[List[Dict[str, Any]]]) -> str:
                 value = f"<del>{value}</del>"
             if annotations.get("underline"):
                 value = f"<u>{value}</u>"
+
+        color_style = rich_text_color_style(annotations, default_color)
+        if color_style:
+            value = f'<span style="{color_style}">{value}</span>'
 
         link_data = text_data.get("link") if isinstance(text_data.get("link"), dict) else {}
         href = safe_html_url(item.get("href") or link_data.get("url") or "")
@@ -1035,9 +1097,9 @@ def render_media_block_html(
         click_url = github_raw_url_for_asset(asset_dir, local_path) if local_path else url
         safe_click = safe_html_url(click_url) or safe_target
         return (
-            '<p style="margin:.75rem 0;">'
+            '<p class="notion-image" style="box-sizing:border-box;width:100%;max-width:100%;margin:.75rem 0;">'
             f'<a href="{safe_click}"><img src="{safe_target}" alt="{alt}" '
-            'style="display:block;max-width:100%;height:auto;border-radius:8px;"></a>'
+            'style="display:block;width:100%;max-width:100%;height:auto;border-radius:8px;"></a>'
             '</p>\n'
         )
 
@@ -1061,7 +1123,7 @@ def render_blocks_as_html(
     asset_counter: Optional[List[int]] = None,
     depth: int = 0,
 ) -> str:
-    """Callout/Quote 내부의 하위 Notion 블록을 Markdown 손실 없이 HTML로 렌더링합니다."""
+    """Render nested Notion blocks to HTML without losing spacing, colors or structure."""
     if depth > MAX_BLOCK_DEPTH:
         return '<p><em>중첩 블록 깊이 제한으로 일부 내용을 생략했습니다.</em></p>\n'
     if asset_counter is None:
@@ -1075,43 +1137,54 @@ def render_blocks_as_html(
         block_type = block.get("type", "")
         data = block.get(block_type, {}) or {}
         rich = data.get("rich_text", []) or []
-        content = rich_text_to_html(rich)
+        block_color = data.get("color")
+        content = rich_text_to_html(rich, default_color=block_color)
         children = block.get("_children", []) or []
 
-        # 연속된 목록 항목은 하나의 ul/ol로 묶고, 자식 블록은 해당 li 안에 유지합니다.
+        # Group adjacent list items while retaining nested children inside each item.
         if block_type in {"bulleted_list_item", "numbered_list_item"}:
             tag = "ul" if block_type == "bulleted_list_item" else "ol"
             list_items: List[str] = []
             while index < len(items) and items[index].get("type") == block_type:
                 list_block = items[index]
                 list_data = list_block.get(block_type, {}) or {}
-                list_content = rich_text_to_html(list_data.get("rich_text", []) or [])
+                list_content = rich_text_to_html(
+                    list_data.get("rich_text", []) or [], default_color=list_data.get("color")
+                )
                 nested = render_blocks_as_html(
                     list_block.get("_children", []) or [], asset_dir, asset_counter, depth + 1
                 )
-                list_items.append(f"<li>{list_content}{nested}</li>")
+                list_items.append(
+                    f'<li style="margin:.30rem 0;line-height:1.5;">{list_content}{nested}</li>'
+                )
                 index += 1
             output.append(
-                f'<{tag} style="margin:.5rem 0 .75rem 1.5rem;padding-left:.6rem;">'
-                + "".join(list_items) + f"</{tag}>\n"
+                f'<{tag} style="list-style-position:outside;margin:.5rem 0 .75rem;'
+                'padding-left:1.5rem;">' + "".join(list_items) + f"</{tag}>\n"
             )
             continue
 
         if block_type == "paragraph":
             if content.strip():
-                output.append(f'<p style="margin:.35rem 0 .75rem;">{content}</p>\n')
+                output.append(f'<p style="margin:.35rem 0 .75rem;line-height:1.55;">{content}</p>\n')
+            else:
+                # An empty Notion paragraph is a deliberate visual spacer, not disposable content.
+                output.append(
+                    '<div class="notion-spacer" aria-hidden="true" '
+                    'style="display:block;width:100%;height:1.5rem;min-height:1.5rem;"></div>\n'
+                )
             if children:
                 output.append(render_blocks_as_html(children, asset_dir, asset_counter, depth + 1))
         elif block_type in {"heading_1", "heading_2", "heading_3", "heading_4", "heading_5", "heading_6"}:
             level = int(block_type[-1])
-            output.append(f'<h{level} style="margin:1rem 0 .55rem;">{content}</h{level}>\n')
+            output.append(f'<h{level} style="margin:1rem 0 .55rem;line-height:1.4;">{content}</h{level}>\n')
             if children:
                 output.append(render_blocks_as_html(children, asset_dir, asset_counter, depth + 1))
         elif block_type == "to_do":
             checked = bool(data.get("checked"))
             mark = "☑" if checked else "☐"
             nested = render_blocks_as_html(children, asset_dir, asset_counter, depth + 1)
-            output.append(f'<div style="margin:.35rem 0;">{mark} {content}{nested}</div>\n')
+            output.append(f'<div style="margin:.35rem 0;line-height:1.5;">{mark} {content}{nested}</div>\n')
         elif block_type == "toggle":
             summary = content or "자세히 보기"
             nested = render_blocks_as_html(children, asset_dir, asset_counter, depth + 1)
@@ -1119,24 +1192,30 @@ def render_blocks_as_html(
         elif block_type == "quote":
             nested = render_blocks_as_html(children, asset_dir, asset_counter, depth + 1)
             output.append(
-                '<blockquote class="notion-quote" style="margin:1rem 0 1.25rem;padding:.35rem 0 .35rem 1rem;'
+                '<blockquote class="notion-quote" style="box-sizing:border-box;width:100%;max-width:100%;'
+                'margin:1rem 0 1.25rem;padding:.35rem 0 .35rem 1rem;'
                 'border-left:3px solid rgba(220,220,220,.72);color:inherit;">'
                 f'{f"<p style=\"margin:.25rem 0 .5rem;\">{content}</p>" if content else ""}{nested}</blockquote>\n'
             )
         elif block_type == "callout":
             icon_data = data.get("icon", {}) or {}
             icon = icon_data.get("emoji") or "💡"
+            # Keep the title and every child block in the same text column.
+            # This mirrors Notion's icon + content layout and prevents paragraphs,
+            # spacers, and lists from jumping back to the card's left padding.
             nested = render_blocks_as_html(children, asset_dir, asset_counter, depth + 1)
-            header = (
-                f'<div style="display:flex;align-items:flex-start;gap:.65rem;">'
-                f'<span aria-hidden="true" style="flex:0 0 auto;">{html.escape(str(icon))}</span>'
-                f'<div style="min-width:0;flex:1;">{content}</div></div>'
-            ) if content else ""
+            body = f'{content}{nested}'
             output.append(
-                '<div class="notion-callout" style="display:block;margin:1.1rem 0;padding:1rem 1.25rem;'
+                '<div class="notion-callout" style="box-sizing:border-box;display:block;'
+                'width:100%;max-width:100%;margin:1.1rem 0;padding:1rem 1.25rem;'
                 'background:rgba(255,255,255,.075);border:1px solid rgba(255,255,255,.12);'
-                'border-left:4px solid #76b900;border-radius:10px;color:inherit;">'
-                f'{header}{nested}</div>\n'
+                'border-left:4px solid #76b900;border-radius:10px;color:inherit;line-height:1.55;">'
+                '<div class="notion-callout-layout" style="display:flex;align-items:flex-start;'
+                'gap:.65rem;width:100%;min-width:0;">'
+                f'<span aria-hidden="true" style="flex:0 0 auto;line-height:1.55;">{html.escape(str(icon))}</span>'
+                f'<div class="notion-callout-content" style="box-sizing:border-box;flex:1 1 auto;'
+                f'min-width:0;width:100%;">{body}</div>'
+                '</div></div>\n'
             )
         elif block_type == "code":
             language = normalize_github_language(data.get("language", "text"))
@@ -1176,7 +1255,6 @@ def render_blocks_as_html(
                 page_url = f"https://www.notion.so/{str(page_ref).replace('-', '')}"
                 output.append(f'<p><a href="{safe_html_url(page_url)}">Notion 페이지 열기</a></p>\n')
         else:
-            # 알 수 없는 유형이라도 하위 블록을 가능한 한 보존합니다.
             if content:
                 output.append(f'<p>{content}</p>\n')
             if children:
@@ -1227,13 +1305,15 @@ def render_blocks(
         # 제목은 #~###### 자체로 시각적 강조가 적용되므로,
         # Notion의 굵게 서식까지 **로 중복 변환하지 않습니다.
         is_heading = block_type in {"heading_1", "heading_2", "heading_3", "heading_4", "heading_5", "heading_6"}
-        content = rich_text_to_markdown(rich, preserve_bold=not is_heading)
+        content = rich_text_to_markdown(rich, preserve_bold=not is_heading, default_color=data.get("color"))
         children = block.get("_children", []) or []
 
         if block_type == "paragraph":
             if content.strip():
                 output.append(f"{indent_text}{content}\n\n")
-            elif children:
+            else:
+                output.append('<div class="notion-spacer" aria-hidden="true" style="height:1.5rem;min-height:1.5rem;"></div>\n\n')
+            if children:
                 output.append(render_blocks(children, asset_dir, indent, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
 
         elif block_type in {"heading_1", "heading_2", "heading_3", "heading_4", "heading_5", "heading_6"}:
