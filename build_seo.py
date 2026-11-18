@@ -214,17 +214,44 @@ def main():
 
         canonical = f"{SITE_URL}/posts/{page_id}/"
         page = template
-        page = page.replace(
-            '<meta name="description" content="S급 로봇 연구소 — 로봇과 인간이 공존할 미래를 준비합니다.">',
-            f'<meta name="description" content="{esc(desc)}">\n'
-            f'  <link rel="canonical" href="{canonical}">\n'
-            f'  <meta property="og:type" content="article">\n'
-            f'  <meta property="og:site_name" content="{BRAND}">\n'
-            f'  <meta property="og:title" content="{esc(title)} | {BRAND}">\n'
-            f'  <meta property="og:description" content="{esc(desc)}">\n'
-            f'  <meta property="og:url" content="{canonical}">\n'
-            f'  <meta property="article:published_time" content="{esc(date)}">',
+
+        # Set a unique description for this article.
+        description_tag = f'<meta name="description" content="{esc(desc)}">'
+        page, replaced = re.subn(
+            r'<meta name="description" content="[^"]*">',
+            lambda _match: description_tag,
+            page,
+            count=1,
+            flags=re.I,
         )
+        if replaced != 1:
+            raise RuntimeError("post.html must contain exactly one meta description tag")
+
+        # Remove the generic fallback metadata in post.html, then add article-specific values.
+        page = "\n".join(
+            line for line in page.splitlines()
+            if not re.match(r'^[ \t]*<meta[ \t]+(?:property="og:|name="twitter:)', line, re.I)
+            and not re.match(r'^[ \t]*<link[ \t]+rel="canonical"', line, re.I)
+        )
+        article_title = f"{title} | {BRAND}"
+        article_image = f"{SITE_URL}/images/sss-robotics-logo.png"
+        article_meta = "\n".join([
+            f'  <link rel="canonical" href="{canonical}">',
+            '  <meta property="og:type" content="article">',
+            f'  <meta property="og:site_name" content="{esc(BRAND)}">',
+            f'  <meta property="og:title" content="{esc(article_title)}">',
+            f'  <meta property="og:description" content="{esc(desc)}">',
+            f'  <meta property="og:url" content="{canonical}">',
+            f'  <meta property="og:image" content="{article_image}">',
+            '  <meta property="og:image:alt" content="S급 로봇 연구소 공식 로고">',
+            '  <meta property="og:locale" content="ko_KR">',
+            '  <meta name="twitter:card" content="summary">',
+            f'  <meta name="twitter:title" content="{esc(article_title)}">',
+            f'  <meta name="twitter:description" content="{esc(desc)}">',
+            f'  <meta name="twitter:image" content="{article_image}">',
+            f'  <meta property="article:published_time" content="{esc(date)}">',
+        ])
+        page = page.replace(description_tag, description_tag + "\n" + article_meta, 1)
         page = page.replace(
             "<title>S급 로봇 연구소 - 로봇과 인간이 공존할 미래를 준비합니다.</title>",
             f"<title>{esc(title)} | {BRAND}</title>",
