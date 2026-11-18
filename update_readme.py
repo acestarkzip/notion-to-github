@@ -34,13 +34,14 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.15-visual-fidelity-v2"
+EXPORTER_VERSION = "2026.11.18-notion-number-order-v1"
 
 SAVE_DIR_ROOT = Path("TIL")
 ACTIVE_PAGES_MANIFEST = Path("notion-active-pages.json")
 NOTION_PROPERTY_TITLE = "제목"
 NOTION_PROPERTY_DATE = "날짜"
 NOTION_PROPERTY_MEMO = "간단메모"
+NOTION_PROPERTY_NUMBER = "번호"
 README_FILE = Path("README.md")
 TIMEZONE_HOURS = 9
 
@@ -428,6 +429,34 @@ def get_page_date(page: Dict[str, Any]) -> Optional[str]:
     date_value = date_property.get("date") or {}
     start = date_value.get("start")
     return str(start)[:10] if start else None
+
+
+def get_page_number(page: Dict[str, Any]) -> Optional[float]:
+    """Notion 데이터베이스의 '번호' 숫자 속성을 읽습니다.
+
+    숫자 속성이 비어 있거나 존재하지 않으면 None을 반환하여
+    게시글 생성 시각을 보조 정렬 기준으로 사용할 수 있게 합니다.
+    """
+    properties = page.get("properties", {}) or {}
+    number_property = properties.get(NOTION_PROPERTY_NUMBER, {}) or {}
+    if not isinstance(number_property, dict):
+        return None
+
+    value = number_property.get("number")
+
+    # 수식/고유 ID 속성으로 설정된 데이터베이스에도 대응합니다.
+    if value is None:
+        formula = number_property.get("formula", {}) or {}
+        if isinstance(formula, dict):
+            value = formula.get("number")
+    if value is None:
+        unique_id = number_property.get("unique_id", {}) or {}
+        if isinstance(unique_id, dict):
+            value = unique_id.get("number")
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
 
 
 def get_page_memo(page: Dict[str, Any]) -> str:
@@ -1919,6 +1948,8 @@ def write_active_pages_manifest(pages: List[Dict[str, Any]], fetch_mode: str) ->
             "notion_page_id": page_id,
             "title": get_title_from_page(page),
             "date": page_date,
+            "number": get_page_number(page),
+            "created_time": str(page.get("created_time") or ""),
             "memo": get_page_memo(page),
             "tags": get_page_tags(page),
             "url": str(page.get("url") or ""),
