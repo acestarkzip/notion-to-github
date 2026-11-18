@@ -34,7 +34,7 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.18-notion-number-order-toc-nesting-v2"
+EXPORTER_VERSION = "2026.11.18-notion-number-order-toc-bullets-v3"
 
 SAVE_DIR_ROOT = Path("TIL")
 ACTIVE_PAGES_MANIFEST = Path("notion-active-pages.json")
@@ -1371,18 +1371,21 @@ def render_blocks(
         elif block_type == "bulleted_list_item":
             output.append(f"{indent_text}- {content}\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent + 2, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
+                # Python-Markdown (used by the static SEO page builder) expects
+                # four spaces for each nested list level. Two spaces can be parsed
+                # as a separate top-level list, making Notion bullets look flat.
+                output.append(render_blocks(children, asset_dir, indent + 4, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
 
         elif block_type == "numbered_list_item":
             output.append(f"{indent_text}1. {content}\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent + 3, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
+                output.append(render_blocks(children, asset_dir, indent + 4, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
 
         elif block_type == "to_do":
             checked = "x" if data.get("checked") else " "
             output.append(f"{indent_text}- [{checked}] {content}\n")
             if children:
-                output.append(render_blocks(children, asset_dir, indent + 2, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
+                output.append(render_blocks(children, asset_dir, indent + 4, toc_markdown, asset_counter, [asset_context[0]], list(heading_stack)))
 
         elif block_type == "toggle":
             output.append(f"{indent_text}<details>\n{indent_text}<summary>{content or '자세히 보기'}</summary>\n\n")
