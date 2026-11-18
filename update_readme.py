@@ -34,7 +34,7 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.18-notion-number-order-v1"
+EXPORTER_VERSION = "2026.11.18-notion-number-order-toc-nesting-v2"
 
 SAVE_DIR_ROOT = Path("TIL")
 ACTIVE_PAGES_MANIFEST = Path("notion-active-pages.json")
@@ -819,7 +819,9 @@ def build_table_of_contents(headings: List[Dict[str, Any]]) -> str:
     min_level = min(item["level"] for item in headings)
     lines: List[str] = []
     for item in headings:
-        indent = "  " * max(0, int(item["level"]) - min_level)
+        # Python-Markdown needs four leading spaces per nested list level.
+        # Two spaces can be parsed as a sibling list, flattening H1/H2/H3/H4 in the HTML.
+        indent = "    " * max(0, int(item["level"]) - min_level)
         # Escape Markdown link-label brackets without changing visible title text.
         label = str(item["title"]).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
         lines.append(f"{indent}- [{label}](#{item['anchor']})")
