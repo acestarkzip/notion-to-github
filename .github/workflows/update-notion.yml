@@ -69,7 +69,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: python -m pip install --upgrade pip requests Markdown bleach
+        run: python -m pip install --upgrade pip requests Markdown bleach tinycss2
 
       # 예약 시간에 따라 조회 모드를 결정합니다.
       # 일일 실행은 Notion '날짜' 속성 기준, 주간 실행은 last_edited_time 기준,
