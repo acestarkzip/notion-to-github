@@ -230,6 +230,17 @@ def main():
             f"<title>{esc(title)} | {BRAND}</title>",
         )
         page = page.replace('href="./', 'href="/').replace('src="./', 'src="/')
+        # Keep generated article pages on the same current favicon as the site root.
+        favicon_block = (
+            '  <!-- SSS Robotics current brand favicon (cache-busted) -->\n'
+            '  <link rel="icon" href="/favicon.ico?v=20261118" sizes="any">\n'
+            '  <link rel="icon" type="image/png" href="/favicon.png?v=20261118">\n'
+            '  <link rel="shortcut icon" href="/favicon.ico?v=20261118">\n'
+            '  <link rel="apple-touch-icon" href="/favicon.png?v=20261118">'
+        )
+        page = re.sub(r'\s*<link\s+rel="(?:shortcut icon|icon)"[^>]*>', '', page, flags=re.I)
+        page = page.replace('<meta name="theme-color" content="#080b09">',
+                            '<meta name="theme-color" content="#080b09">\n' + favicon_block, 1)
         page = page.replace('href="/index.html#', 'href="/#')
         page = page.replace("게시글을 불러오는 중입니다...", esc(title))
         page = page.replace(
