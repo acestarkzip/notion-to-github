@@ -467,6 +467,8 @@ jobs:
                   "notion_page_id": page_id,
                   "title": str(item.get("title") or "Untitled note").strip() or "Untitled note",
                   "date": date_value,
+                  "number": item.get("number") if isinstance(item.get("number"), (int, float)) and not isinstance(item.get("number"), bool) else None,
+                  "created_time": str(item.get("created_time") or ""),
                   "memo": str(item.get("memo") or "").strip(),
                   "tags": item.get("tags", []) if isinstance(item.get("tags", []), list) else [],
                   "url": str(item.get("url") or ""),
@@ -543,9 +545,11 @@ jobs:
               path = candidate[1]
               posts.append({
                   "path": path.relative_to(Path("pages-site")).as_posix(),
-                  # Title/date/memo come from the current Notion page properties, not
-                  # from an old Markdown filename or stale Markdown metadata.
+                  # Current Notion properties are authoritative; Markdown filenames are
+                  # used only to locate the exported content, not to determine display order.
                   "date": page["date"],
+                  "number": page["number"],
+                  "created_time": page["created_time"],
                   "title": page["title"],
                   "memo": page["memo"],
                   "tags": page["tags"],
@@ -553,7 +557,23 @@ jobs:
                   "notion_url": page["url"],
               })
 
-          posts.sort(key=lambda item: (item["date"], item["title"].casefold(), item["notion_page_id"]), reverse=True)
+          # Prefer the explicit Notion number (42, 41, 40 ...). Pages without a
+          # number are listed afterward by their original Notion creation time.
+          numbered_posts = [
+              item for item in posts
+              if isinstance(item.get("number"), (int, float)) and not isinstance(item.get("number"), bool)
+          ]
+          unnumbered_posts = [item for item in posts if item not in numbered_posts]
+
+          numbered_posts.sort(
+              key=lambda item: (float(item["number"]), item.get("created_time") or "", item["notion_page_id"]),
+              reverse=True,
+          )
+          unnumbered_posts.sort(
+              key=lambda item: (item.get("created_time") or "", item["date"], item["notion_page_id"]),
+              reverse=True,
+          )
+          posts = numbered_posts + unnumbered_posts
           payload = {
               "schema_version": 3,
               "source_of_truth": "notion_database",
