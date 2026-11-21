@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build crawlable static article pages and sitemap from the Notion-authoritative index."""
+"""Build SEO-ready static article pages with native and resilient TOC navigation, BlogPosting JSON-LD, sitemap, and RSS from Notion index."""
 from __future__ import annotations
 
 import argparse
@@ -30,6 +30,121 @@ RAW_ASSET_BASE = os.environ.get(
 ).strip().rstrip("/")
 
 
+# Static article pages do not load js/post.js: the article HTML is already built
+# into /posts/<notion-page-id>/index.html. Keep TOC navigation self-contained so
+# it works on the published static page, including when a stale/missing target
+# ID has to be recovered from the visible TOC label.
+STATIC_TOC_NAV_SCRIPT = r"""<script>
+(() => {
+  "use strict";
+
+  const root = document.getElementById("markdown-content");
+  if (!root) return;
+
+  const headings = Array.from(root.querySelectorAll("h1, h2, h3, h4, h5, h6"));
+  const usedHeadings = new Set();
+  const tocLinks = Array.from(root.querySelectorAll('a[href^="#"]'));
+
+  const normalize = (value) => String(value || "")
+    .normalize("NFKC")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const comparable = (value) => normalize(value)
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "");
+
+  function getFragment(link) {
+    const href = link.getAttribute("href") || "";
+    const fragment = href.startsWith("#") ? href.slice(1) : "";
+    if (!fragment) return "";
+    try { return decodeURIComponent(fragment); } catch (_) { return fragment; }
+  }
+
+  function findTarget(link) {
+    const id = getFragment(link);
+    if (!id) return null;
+
+    const existing = document.getElementById(id);
+    if (existing && root.contains(existing)) return existing;
+
+    const label = normalize(link.textContent);
+    const labelKey = comparable(label);
+    if (!labelKey) return null;
+
+    let target = headings.find((heading) =>
+      !usedHeadings.has(heading) && normalize(heading.textContent) === label
+    );
+    if (!target) {
+      target = headings.find((heading) =>
+        !usedHeadings.has(heading) && comparable(heading.textContent) === labelKey
+      );
+    }
+    if (!target) return null;
+
+    target.id = id;
+    usedHeadings.add(target);
+    return target;
+  }
+
+  function prepareTargets() {
+    headings.forEach((heading) => {
+      heading.style.scrollMarginTop = "112px";
+    });
+    tocLinks.forEach(findTarget);
+  }
+
+  function scrollToTarget(target, updateAddress) {
+    if (!target) return;
+    if (updateAddress && target.id) {
+      const nextHash = `#${encodeURIComponent(target.id)}`;
+      if (window.location.hash !== nextHash) {
+        window.history.pushState(null, "", nextHash);
+      }
+    }
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    target.scrollIntoView({
+      behavior: reduceMotion ? "auto" : "smooth",
+      block: "start"
+    });
+  }
+
+  root.addEventListener("click", (event) => {
+    const origin = event.target instanceof Element ? event.target : event.target.parentElement;
+    const link = origin && origin.closest('a[href^="#"]');
+    if (!link || !root.contains(link)) return;
+
+    const target = findTarget(link);
+    if (!target) return;
+    event.preventDefault();
+    scrollToTarget(target, true);
+  });
+
+  function restoreHashPosition() {
+    const rawHash = window.location.hash.slice(1);
+    if (!rawHash) return;
+    let id = rawHash;
+    try { id = decodeURIComponent(rawHash); } catch (_) { /* keep raw hash */ }
+
+    let target = document.getElementById(id);
+    if (!target || !root.contains(target)) {
+      const matchingLink = tocLinks.find((link) => getFragment(link) === id);
+      if (matchingLink) target = findTarget(matchingLink);
+    }
+    if (target && root.contains(target)) {
+      requestAnimationFrame(() => requestAnimationFrame(() => scrollToTarget(target, false)));
+    }
+  }
+
+  prepareTargets();
+  window.addEventListener("hashchange", restoreHashPosition);
+  window.addEventListener("load", restoreHashPosition, { once: true });
+  if (window.location.hash) restoreHashPosition();
+})();
+</script>"""
+
+
 def esc(value):
     return html.escape(str(value or ""), quote=True)
 
@@ -49,6 +164,9 @@ def description_from(markdown_text, memo):
         line = line.strip()
         if not line or line.startswith(("#", ">", "|", "---")):
             continue
+        # Do not use generated TOC entries as search snippets; prefer actual article text.
+        if re.match(r"^\s*(?:[-*+] |\d+\. )?\[[^]]+\]\(#notion-heading-[0-9a-f]{32}\)", line, re.I):
+            continue
         line = re.sub(r"!\[([^]]*)\]\([^)]*\)", r"\1", line)
         line = re.sub(r"\[([^]]+)\]\([^)]*\)", r"\1", line)
         line = re.sub(r"[`*_~]", "", line)
@@ -60,6 +178,168 @@ def description_from(markdown_text, memo):
             break
     result = " ".join(lines) or memo or DEFAULT_DESCRIPTION
     return result[:155].rsplit(" ", 1)[0] if len(result) > 155 else result
+
+
+def normalize_iso_datetime(value, fallback_date=""):
+    """Return a Schema.org-friendly ISO datetime/date without inventing timestamps."""
+    raw = str(value or "").strip()
+    if raw:
+        # A Notion date property is often date-only; keep it date-only rather than
+        # inventing a midnight UTC timestamp. last_edited_time remains a datetime.
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            try:
+                return date_cls.fromisoformat(raw).isoformat()
+            except ValueError:
+                return ""
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        except ValueError:
+            try:
+                return date_cls.fromisoformat(raw[:10]).isoformat()
+            except ValueError:
+                pass
+    if fallback_date:
+        try:
+            return date_cls.fromisoformat(str(fallback_date)[:10]).isoformat()
+        except ValueError:
+            pass
+    return ""
+
+
+def notion_tag_names(post):
+    """Read tag names from the current Notion-authoritative blog-index schema."""
+    names = []
+    for tag in post.get("tags", []) or []:
+        if isinstance(tag, dict):
+            name = str(tag.get("name") or "").strip()
+        else:
+            name = str(tag or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def attach_heading_anchor_ids(fragment):
+    """Move legacy Notion anchors onto the next H1-H6 before Bleach sanitizes HTML."""
+    anchor = r'<a\b[^>]*\bname=["\'](?P<name>notion-heading-[0-9a-f]{32})["\'][^>]*>\s*</a>'
+    pattern = re.compile(
+        r'(?:<p\b[^>]*>\s*)?' + anchor + r'(?:\s*</p>)?\s*(?P<heading><h[1-6]\b[^>]*>)',
+        re.I,
+    )
+    converted = 0
+
+    def replace(match):
+        nonlocal converted
+        heading_tag = match.group("heading")
+        anchor_id = match.group("name")
+        if re.search(r'\bid=["\']', heading_tag, re.I):
+            heading_tag = re.sub(
+                r'\bid=(["\'])[^"\']*\1',
+                lambda _id_match: f'id="{esc(anchor_id)}"',
+                heading_tag,
+                count=1,
+                flags=re.I,
+            )
+        else:
+            heading_tag = heading_tag[:-1] + f' id="{esc(anchor_id)}">'
+
+        # Avoid having the sticky navigation cover the target heading.
+        if re.search(r'\bstyle=["\']', heading_tag, re.I):
+            heading_tag = re.sub(
+                r'\bstyle=(["\'])(.*?)\1',
+                lambda style_match: (
+                    f'style={style_match.group(1)}'
+                    f'{style_match.group(2).rstrip("; ")};scroll-margin-top:112px'
+                    f'{style_match.group(1)}'
+                ),
+                heading_tag,
+                count=1,
+                flags=re.I,
+            )
+        else:
+            heading_tag = heading_tag[:-1] + ' style="scroll-margin-top:112px">'
+        converted += 1
+        return heading_tag
+
+    output = pattern.sub(replace, fragment)
+    # Remove remaining empty legacy anchors; valid anchors have moved to headings.
+    output = re.sub(r'(?:<p\b[^>]*>\s*)?' + anchor + r'(?:\s*</p>)?', "", output, flags=re.I)
+
+    toc_ids = set(re.findall(r'href=["\']#(notion-heading-[0-9a-f]{32})["\']', output, flags=re.I))
+    heading_ids = set(re.findall(r'<h[1-6]\b[^>]*\bid=["\'](notion-heading-[0-9a-f]{32})["\']', output, flags=re.I))
+    missing = sorted(toc_ids - heading_ids)
+    if missing:
+        raise RuntimeError(
+            "TOC contains heading links without matching heading IDs after anchor conversion: "
+            + ", ".join(missing[:10])
+        )
+    return output, converted, len(toc_ids)
+
+def first_image_from_html(fragment):
+    from html.parser import HTMLParser
+
+    class ImageExtractor(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.image = None
+
+        def handle_starttag(self, tag, attrs):
+            if tag.lower() != "img" or self.image:
+                return
+            attrs = dict(attrs)
+            src = str(attrs.get("src") or "").strip()
+            if src.startswith(("https://", "http://")):
+                self.image = {"url": src, "alt": str(attrs.get("alt") or "").strip()}
+
+    parser = ImageExtractor()
+    parser.feed(str(fragment or ""))
+    parser.close()
+    return parser.image
+
+
+def build_blogposting_jsonld(post, title, description, canonical, article_image, body):
+    """Create per-article structured data using only Notion/source-derived fields."""
+    date_published = normalize_iso_datetime(post.get("date"))
+    date_modified = normalize_iso_datetime(post.get("last_edited_time"), date_published)
+    tags = notion_tag_names(post)
+    image_obj = first_image_from_html(body)
+    image_url = image_obj["url"] if image_obj else article_image
+    schema = {
+        "@context": "https://schema.org",
+        "@type": "BlogPosting",
+        "@id": canonical + "#blogposting",
+        "mainEntityOfPage": {"@type": "WebPage", "@id": canonical},
+        "headline": title,
+        "description": description,
+        "image": [image_url],
+        "author": {
+            "@type": "Organization",
+            "@id": SITE_URL + "/#organization",
+            "name": BRAND,
+            "url": SITE_URL + "/",
+        },
+        "publisher": {
+            "@type": "Organization",
+            "@id": SITE_URL + "/#organization",
+            "name": BRAND,
+            "logo": {"@type": "ImageObject", "url": SITE_URL + "/images/sss-robotics-logo.png"},
+        },
+        "inLanguage": "ko-KR",
+        "isAccessibleForFree": True,
+    }
+    if date_published:
+        schema["datePublished"] = date_published
+    if date_modified:
+        schema["dateModified"] = date_modified
+    if tags:
+        schema["keywords"] = tags
+        schema["articleSection"] = tags[0]
+    encoded = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+    encoded = encoded.replace("</", "<\\/")
+    return '<script type="application/ld+json">' + encoded + "</script>"
 
 
 def rewrite_local_links(fragment, md_path, site_root):
@@ -162,6 +442,7 @@ def main():
     template = template_path.read_text(encoding="utf-8")
     urls = {SITE_URL + "/", SITE_URL + "/blog.html"}
     generated = 0
+    rss_content_by_id = {}
     raw_ids = [safe_slug(post.get("notion_page_id")) for post in index["posts"]]
     if len(raw_ids) != len(set(raw_ids)):
         raise RuntimeError("Duplicate Notion page IDs detected in blog-index.json")
@@ -174,6 +455,8 @@ def main():
     allowed_attributes = {
         **bleach.sanitizer.ALLOWED_ATTRIBUTES,
         "a": ["href", "title", "target", "rel", "class"],
+        "h1": ["id", "style"], "h2": ["id", "style"], "h3": ["id", "style"],
+        "h4": ["id", "style"], "h5": ["id", "style"], "h6": ["id", "style"],
         "img": ["src", "alt", "title", "width", "height", "class", "style"],
         "p": ["class", "style"],
         "blockquote": ["class", "style"],
@@ -191,6 +474,7 @@ def main():
         "box-sizing", "width", "max-width", "height", "margin", "display",
         "border-radius", "list-style-position", "padding", "line-height",
         "border-left", "color", "font-size", "text-align", "vertical-align",
+        "scroll-margin-top",
     })
 
     for post in index["posts"]:
@@ -209,7 +493,9 @@ def main():
         raw = md_file.read_text(encoding="utf-8")
         desc = description_from(raw, post.get("memo", ""))
         body = markdown.markdown(raw, extensions=["extra", "sane_lists", "nl2br"])
+        # The first H1 is the document title rendered in the page header, not body content.
         body = re.sub(r"<h1\b[^>]*>.*?</h1>\s*", "", body, count=1, flags=re.I | re.S)
+        body, anchor_count, toc_link_count = attach_heading_anchor_ids(body)
         body = bleach.clean(
             body,
             tags=allowed_tags,
@@ -218,6 +504,15 @@ def main():
             css_sanitizer=css_sanitizer,
         )
         body = rewrite_local_links(body, md_file, root)
+        # Re-check after sanitization/link rewriting, not only before sanitization.
+        final_toc_ids = set(re.findall(r'href=["\']#(notion-heading-[0-9a-f]{32})["\']', body, flags=re.I))
+        final_heading_ids = set(re.findall(r'<h[1-6]\b[^>]*\bid=["\'](notion-heading-[0-9a-f]{32})["\']', body, flags=re.I))
+        final_missing = sorted(final_toc_ids - final_heading_ids)
+        if final_missing:
+            raise RuntimeError(
+                f"TOC targets were removed during HTML sanitization for {page_id}: "
+                + ", ".join(final_missing[:10])
+            )
 
         canonical = f"{SITE_URL}/posts/{page_id}/"
         page = template
@@ -242,24 +537,43 @@ def main():
             and not re.match(r'^[ \t]*<link[ \t]+rel="canonical"', line, re.I)
         )
         article_title = f"{title} | {BRAND}"
-        article_image = f"{SITE_URL}/images/sss-robotics-logo.png"
-        article_meta = "\n".join([
+        default_article_image = f"{SITE_URL}/images/sss-robotics-logo.png"
+        image_info = first_image_from_html(body)
+        article_image = image_info["url"] if image_info else default_article_image
+        article_image_alt = (image_info.get("alt") if image_info else "") or f"{title} - {BRAND}"
+        tags = notion_tag_names(post)
+        published_time = normalize_iso_datetime(date)
+        modified_time = normalize_iso_datetime(post.get("last_edited_time"), published_time)
+        article_meta_lines = [
             f'  <link rel="canonical" href="{canonical}">',
+            f'  <meta name="author" content="{esc(BRAND)}">',
+            f'  <meta name="keywords" content="{esc(", ".join(tags))}">',
             '  <meta property="og:type" content="article">',
             f'  <meta property="og:site_name" content="{esc(BRAND)}">',
             f'  <meta property="og:title" content="{esc(article_title)}">',
             f'  <meta property="og:description" content="{esc(desc)}">',
             f'  <meta property="og:url" content="{canonical}">',
-            f'  <meta property="og:image" content="{article_image}">',
-            '  <meta property="og:image:alt" content="S급 로봇 연구소 공식 로고">',
+            f'  <meta property="og:image" content="{esc(article_image)}">',
+            f'  <meta property="og:image:alt" content="{esc(article_image_alt)}">',
             '  <meta property="og:locale" content="ko_KR">',
-            '  <meta name="twitter:card" content="summary">',
+            '  <meta name="twitter:card" content="summary_large_image">',
             f'  <meta name="twitter:title" content="{esc(article_title)}">',
             f'  <meta name="twitter:description" content="{esc(desc)}">',
-            f'  <meta name="twitter:image" content="{article_image}">',
-            f'  <meta property="article:published_time" content="{esc(date)}">',
-        ])
+            f'  <meta name="twitter:image" content="{esc(article_image)}">',
+        ]
+        if published_time:
+            article_meta_lines.append(f'  <meta property="article:published_time" content="{esc(published_time)}">')
+        if modified_time:
+            article_meta_lines.append(f'  <meta property="article:modified_time" content="{esc(modified_time)}">')
+        if tags:
+            article_meta_lines.append(f'  <meta property="article:section" content="{esc(tags[0])}">')
+            article_meta_lines.extend(f'  <meta property="article:tag" content="{esc(tag)}">' for tag in tags)
+        article_meta = "\n".join(article_meta_lines)
         page = page.replace(description_tag, description_tag + "\n" + article_meta, 1)
+        jsonld_script = build_blogposting_jsonld(post, title, desc, canonical, default_article_image, body)
+        if "</head>" not in page.lower():
+            raise RuntimeError(f"post.html has no closing head tag: {page_id}")
+        page = re.sub(r"</head>", jsonld_script + "\n</head>", page, count=1, flags=re.I)
         page = page.replace(
             "<title>S급 로봇 연구소 - 로봇과 인간이 공존할 미래를 준비합니다.</title>",
             f"<title>{esc(title)} | {BRAND}</title>",
@@ -284,11 +598,33 @@ def main():
         )
         loading = '<div class="loading-state"><span class="loading-ring" aria-hidden="true"></span><span>Markdown을 불러오는 중입니다...</span></div>'
         page = page.replace(loading, body)
+        # Static SEO pages contain the rendered article HTML, so the dynamic
+        # post.js loader is intentionally removed. Add a lightweight, self-contained
+        # navigation handler for the static page's TOC links instead.
         page = page.replace('<script src="/js/post.js" defer></script>', "")
+        if "</body>" not in page.lower():
+            raise RuntimeError(f"post.html template has no closing body tag: {page_id}")
+        page = re.sub(
+            r"</body>",
+            lambda _match: STATIC_TOC_NAV_SCRIPT + "\n</body>",
+            page,
+            count=1,
+            flags=re.I,
+        )
 
         out = root / "posts" / page_id / "index.html"
         out.parent.mkdir(parents=True, exist_ok=True)
+        # Fail the build rather than publishing an article whose TOC has dangling links.
+        if toc_link_count != anchor_count:
+            # A page without a TOC legitimately has zero link count and zero anchors.
+            if toc_link_count or anchor_count:
+                raise RuntimeError(
+                    f"TOC anchor count mismatch for {page_id}: links={toc_link_count}, anchors={anchor_count}"
+                )
+        if '"@type":"BlogPosting"' not in jsonld_script:
+            raise RuntimeError(f"BlogPosting JSON-LD missing for {page_id}")
         out.write_text(page, encoding="utf-8")
+        rss_content_by_id[page_id] = {"body": body, "description": desc, "title": title, "tags": tags}
         urls.add(canonical)
         generated += 1
 
@@ -322,7 +658,9 @@ def main():
     for post in index["posts"]:
         try:
             page_id = safe_slug(post.get("notion_page_id"))
-            lastmods[f"{SITE_URL}/posts/{page_id}/"] = date_cls.fromisoformat(str(post.get("date", ""))).isoformat()
+            lastmods[f"{SITE_URL}/posts/{page_id}/"] = normalize_iso_datetime(
+                post.get("last_edited_time"), str(post.get("date", ""))
+            )[:10]
         except (ValueError, TypeError):
             continue
 
@@ -337,34 +675,48 @@ def main():
     ET.indent(sitemap_root, space="  ")
     ET.ElementTree(sitemap_root).write(sitemap_path, encoding="utf-8", xml_declaration=True)
 
-    # RSS 2.0 feed: latest posts first, with absolute canonical links.
+    # RSS 2.0 feed: include a concise description and the complete article HTML.
+    # The GitHub Actions workflow runs this builder after every Notion sync, so new
+    # and updated posts receive full RSS content without any manual Pages edits.
+    CONTENT_NS = "http://purl.org/rss/1.0/modules/content/"
+    ATOM_NS = "http://www.w3.org/2005/Atom"
+    ET.register_namespace("content", CONTENT_NS)
+    ET.register_namespace("atom", ATOM_NS)
     rss = ET.Element("rss", {"version": "2.0"})
     channel = ET.SubElement(rss, "channel")
     ET.SubElement(channel, "title").text = f"{BRAND} 기술 블로그"
     ET.SubElement(channel, "link").text = f"{SITE_URL}/blog.html"
     ET.SubElement(channel, "description").text = DEFAULT_DESCRIPTION
     ET.SubElement(channel, "language").text = "ko-KR"
-    ET.SubElement(channel, "atom:link", {
-        "xmlns:atom": "http://www.w3.org/2005/Atom",
+    ET.SubElement(channel, f"{{{ATOM_NS}}}link", {
         "href": f"{SITE_URL}/rss.xml", "rel": "self", "type": "application/rss+xml"
     })
+    ET.SubElement(channel, "lastBuildDate").text = format_datetime(datetime.now(timezone.utc), usegmt=True)
     dated_posts = []
     for post in index["posts"]:
         try:
-            post_date = date_cls.fromisoformat(str(post.get("date", "")))
+            post_date = date_cls.fromisoformat(str(post.get("date", ""))[:10])
+            page_id = safe_slug(post.get("notion_page_id"))
         except (ValueError, TypeError):
             continue
-        page_id = safe_slug(post.get("notion_page_id"))
-        dated_posts.append((post_date, post, f"{SITE_URL}/posts/{page_id}/"))
+        content = rss_content_by_id.get(page_id)
+        if not content:
+            print(f"[WARN] RSS skips post without generated static page: {page_id}")
+            continue
+        dated_posts.append((post_date, post, f"{SITE_URL}/posts/{page_id}/", content))
     dated_posts.sort(key=lambda item: (item[0], item[2]), reverse=True)
-    for post_date, post, link in dated_posts:
+    for post_date, post, link, content in dated_posts:
         item = ET.SubElement(channel, "item")
-        ET.SubElement(item, "title").text = str(post.get("title") or "제목 없는 게시글")
+        ET.SubElement(item, "title").text = content["title"]
         ET.SubElement(item, "link").text = link
         ET.SubElement(item, "guid", {"isPermaLink": "true"}).text = link
         published = datetime.combine(post_date, datetime.min.time(), tzinfo=timezone.utc)
         ET.SubElement(item, "pubDate").text = format_datetime(published, usegmt=True)
-        ET.SubElement(item, "description").text = str(post.get("memo") or DEFAULT_DESCRIPTION)
+        ET.SubElement(item, "description").text = content["description"]
+        # RSS consumers that support the content module receive the full formatted article.
+        ET.SubElement(item, f"{{{CONTENT_NS}}}encoded").text = content["body"]
+        for tag in content["tags"]:
+            ET.SubElement(item, "category").text = tag
     rss_path = root / "rss.xml"
     ET.indent(rss, space="  ")
     ET.ElementTree(rss).write(rss_path, encoding="utf-8", xml_declaration=True)
@@ -381,8 +733,20 @@ def main():
         raise RuntimeError("Sitemap is missing active post URLs: " + ", ".join(sorted(missing_urls)))
     if len(dated_posts) != len(index["posts"]):
         print(f"[WARN] RSS contains {len(dated_posts)} of {len(index['posts'])} posts with valid dates")
-    ET.parse(rss_path)  # Ensure RSS is well-formed XML too.
-    print(f"[SEO] generated {generated} static posts; sitemap URLs={len(sitemap_locs)}; RSS items={len(dated_posts)}")
+    rss_check = ET.parse(rss_path).getroot()  # Ensure RSS is well-formed XML too.
+    rss_items = rss_check.findall("./channel/item")
+    content_items = rss_check.findall(f"./channel/item/{{{CONTENT_NS}}}encoded")
+    if len(rss_items) != len(dated_posts) or len(content_items) != len(rss_items):
+        raise RuntimeError(
+            f"RSS count/content mismatch: items={len(rss_items)}, full_content={len(content_items)}, expected={len(dated_posts)}"
+        )
+    for item in rss_items:
+        if not (item.findtext(f"{{{CONTENT_NS}}}encoded") or "").strip():
+            raise RuntimeError("RSS item is missing full content:encoded")
+    print(
+        f"[SEO] generated {generated} static posts; sitemap URLs={len(sitemap_locs)}; "
+        f"RSS items={len(rss_items)} (full content); BlogPosting JSON-LD={generated}"
+    )
 
 
 if __name__ == "__main__":
