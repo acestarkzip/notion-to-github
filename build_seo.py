@@ -34,115 +34,11 @@ RAW_ASSET_BASE = os.environ.get(
 # into /posts/<notion-page-id>/index.html. Keep TOC navigation self-contained so
 # it works on the published static page, including when a stale/missing target
 # ID has to be recovered from the visible TOC label.
-STATIC_TOC_NAV_SCRIPT = r"""<script>
-(() => {
-  "use strict";
+# TOC links use native same-page HTML anchors (href="#notion-heading-...").
+# Every target ID is added by attach_heading_anchor_ids() and validated before publish.
+# Do not preventDefault() on these links: the browser's native fragment navigation
+# is more reliable across BODY/HTML scrolling roots and remains functional without JS.
 
-  const root = document.getElementById("markdown-content");
-  if (!root) return;
-
-  const headings = Array.from(root.querySelectorAll("h1, h2, h3, h4, h5, h6"));
-  const usedHeadings = new Set();
-  const tocLinks = Array.from(root.querySelectorAll('a[href^="#"]'));
-
-  const normalize = (value) => String(value || "")
-    .normalize("NFKC")
-    .replace(/[\u200B-\u200D\uFEFF]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  const comparable = (value) => normalize(value)
-    .toLocaleLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, "");
-
-  function getFragment(link) {
-    const href = link.getAttribute("href") || "";
-    const fragment = href.startsWith("#") ? href.slice(1) : "";
-    if (!fragment) return "";
-    try { return decodeURIComponent(fragment); } catch (_) { return fragment; }
-  }
-
-  function findTarget(link) {
-    const id = getFragment(link);
-    if (!id) return null;
-
-    const existing = document.getElementById(id);
-    if (existing && root.contains(existing)) return existing;
-
-    const label = normalize(link.textContent);
-    const labelKey = comparable(label);
-    if (!labelKey) return null;
-
-    let target = headings.find((heading) =>
-      !usedHeadings.has(heading) && normalize(heading.textContent) === label
-    );
-    if (!target) {
-      target = headings.find((heading) =>
-        !usedHeadings.has(heading) && comparable(heading.textContent) === labelKey
-      );
-    }
-    if (!target) return null;
-
-    target.id = id;
-    usedHeadings.add(target);
-    return target;
-  }
-
-  function prepareTargets() {
-    headings.forEach((heading) => {
-      heading.style.scrollMarginTop = "112px";
-    });
-    tocLinks.forEach(findTarget);
-  }
-
-  function scrollToTarget(target, updateAddress) {
-    if (!target) return;
-    if (updateAddress && target.id) {
-      const nextHash = `#${encodeURIComponent(target.id)}`;
-      if (window.location.hash !== nextHash) {
-        window.history.pushState(null, "", nextHash);
-      }
-    }
-    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    target.scrollIntoView({
-      behavior: reduceMotion ? "auto" : "smooth",
-      block: "start"
-    });
-  }
-
-  root.addEventListener("click", (event) => {
-    const origin = event.target instanceof Element ? event.target : event.target.parentElement;
-    const link = origin && origin.closest('a[href^="#"]');
-    if (!link || !root.contains(link)) return;
-
-    const target = findTarget(link);
-    if (!target) return;
-    event.preventDefault();
-    scrollToTarget(target, true);
-  });
-
-  function restoreHashPosition() {
-    const rawHash = window.location.hash.slice(1);
-    if (!rawHash) return;
-    let id = rawHash;
-    try { id = decodeURIComponent(rawHash); } catch (_) { /* keep raw hash */ }
-
-    let target = document.getElementById(id);
-    if (!target || !root.contains(target)) {
-      const matchingLink = tocLinks.find((link) => getFragment(link) === id);
-      if (matchingLink) target = findTarget(matchingLink);
-    }
-    if (target && root.contains(target)) {
-      requestAnimationFrame(() => requestAnimationFrame(() => scrollToTarget(target, false)));
-    }
-  }
-
-  prepareTargets();
-  window.addEventListener("hashchange", restoreHashPosition);
-  window.addEventListener("load", restoreHashPosition, { once: true });
-  if (window.location.hash) restoreHashPosition();
-})();
-</script>"""
 
 
 def esc(value):
@@ -252,7 +148,7 @@ def attach_heading_anchor_ids(fragment):
                 r'\bstyle=(["\'])(.*?)\1',
                 lambda style_match: (
                     f'style={style_match.group(1)}'
-                    f'{style_match.group(2).rstrip("; ")};scroll-margin-top:112px'
+                    f'{style_match.group(2).rstrip("; ")};scroll-margin-top:128px'
                     f'{style_match.group(1)}'
                 ),
                 heading_tag,
@@ -260,7 +156,7 @@ def attach_heading_anchor_ids(fragment):
                 flags=re.I,
             )
         else:
-            heading_tag = heading_tag[:-1] + ' style="scroll-margin-top:112px">'
+            heading_tag = heading_tag[:-1] + ' style="scroll-margin-top:128px">'
         converted += 1
         return heading_tag
 
@@ -598,19 +494,12 @@ def main():
         )
         loading = '<div class="loading-state"><span class="loading-ring" aria-hidden="true"></span><span>Markdown을 불러오는 중입니다...</span></div>'
         page = page.replace(loading, body)
-        # Static SEO pages contain the rendered article HTML, so the dynamic
-        # post.js loader is intentionally removed. Add a lightweight, self-contained
-        # navigation handler for the static page's TOC links instead.
+        # Static SEO pages contain the rendered article HTML. The dynamic post.js
+        # loader is intentionally removed. TOC links remain ordinary native anchors;
+        # heading IDs and scroll-margin are generated above and validated below.
         page = page.replace('<script src="/js/post.js" defer></script>', "")
         if "</body>" not in page.lower():
             raise RuntimeError(f"post.html template has no closing body tag: {page_id}")
-        page = re.sub(
-            r"</body>",
-            lambda _match: STATIC_TOC_NAV_SCRIPT + "\n</body>",
-            page,
-            count=1,
-            flags=re.I,
-        )
 
         out = root / "posts" / page_id / "index.html"
         out.parent.mkdir(parents=True, exist_ok=True)
