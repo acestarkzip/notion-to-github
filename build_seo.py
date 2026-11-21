@@ -253,7 +253,7 @@ def attach_heading_anchor_ids(fragment):
                 r'\bstyle=(["\'])(.*?)\1',
                 lambda style_match: (
                     f'style={style_match.group(1)}'
-                    f'{style_match.group(2).rstrip("; ")};scroll-margin-top:16px'
+                    f'{style_match.group(2).rstrip("; ")};scroll-margin-top:0px'
                     f'{style_match.group(1)}'
                 ),
                 heading_tag,
@@ -261,7 +261,7 @@ def attach_heading_anchor_ids(fragment):
                 flags=re.I,
             )
         else:
-            heading_tag = heading_tag[:-1] + ' style="scroll-margin-top:16px">'
+            heading_tag = heading_tag[:-1] + ' style="scroll-margin-top:0px">'
         converted += 1
         return heading_tag
 
