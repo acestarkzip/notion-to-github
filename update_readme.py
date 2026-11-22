@@ -34,7 +34,7 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.22-richtext-highlight-grouping-v4"
+EXPORTER_VERSION = "2026.11.22-richtext-highlight-linebox-v5"
 
 SAVE_DIR_ROOT = Path("TIL")
 ACTIVE_PAGES_MANIFEST = Path("notion-active-pages.json")
@@ -299,7 +299,9 @@ def notion_color_style(color: Optional[str]) -> str:
         return (
             f"background-color:{NOTION_BACKGROUND_COLOR_CSS[token]};"
             f"{foreground}"
-            "border-radius:3px;padding:0 .15em;"
+            # A shared line-height plus vertical padding keeps the highlight band
+            # visually even when bold and regular runs share the same background.
+            "border-radius:3px;padding:.12em .16em;line-height:1.65em;vertical-align:baseline;"
             "-webkit-box-decoration-break:clone;box-decoration-break:clone"
         )
     return ""
