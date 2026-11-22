@@ -34,7 +34,7 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.22-callout-emoji-green-highlight-v3"
+EXPORTER_VERSION = "2026.11.22-richtext-highlight-grouping-v4"
 
 SAVE_DIR_ROOT = Path("TIL")
 ACTIVE_PAGES_MANIFEST = Path("notion-active-pages.json")
@@ -305,12 +305,60 @@ def notion_color_style(color: Optional[str]) -> str:
     return ""
 
 
-def rich_text_color_style(annotations: Dict[str, Any], default_color: Optional[str] = None) -> str:
-    """Prefer per-run color; fall back to the containing Notion block color."""
+def rich_text_color_token(annotations: Dict[str, Any], default_color: Optional[str] = None) -> str:
+    """Return the effective Notion color token for one rich-text run."""
     color = annotations.get("color")
     if not color or color == "default":
         color = default_color
-    return notion_color_style(color)
+    return str(color or "default").strip().lower()
+
+
+def rich_text_color_style(annotations: Dict[str, Any], default_color: Optional[str] = None) -> str:
+    """Prefer per-run color; fall back to the containing Notion block color."""
+    return notion_color_style(rich_text_color_token(annotations, default_color))
+
+
+def iter_rich_text_groups(
+    rich_text_list: Optional[List[Dict[str, Any]]],
+    default_color: Optional[str] = None,
+) -> Iterable[Tuple[Optional[str], List[Dict[str, Any]]]]:
+    """Group adjacent rich-text runs that share one background color.
+
+    Formatting such as bold, italic, underline, code, and links remains on the
+    individual child runs. The shared background is emitted once around the
+    complete contiguous group so font-metric differences cannot create visible
+    seams between adjacent highlighted fragments.
+    """
+    items = list(rich_text_list or [])
+    index = 0
+    while index < len(items):
+        item = items[index]
+        if not isinstance(item, dict):
+            index += 1
+            continue
+
+        annotations = item.get("annotations", {}) or {}
+        token = rich_text_color_token(annotations, default_color)
+        background_token = token if token in NOTION_BACKGROUND_COLOR_CSS else None
+
+        if background_token:
+            group: List[Dict[str, Any]] = []
+            while index < len(items):
+                candidate = items[index]
+                if not isinstance(candidate, dict):
+                    break
+                candidate_annotations = candidate.get("annotations", {}) or {}
+                candidate_token = rich_text_color_token(candidate_annotations, default_color)
+                if candidate_token != background_token:
+                    break
+                group.append(candidate)
+                index += 1
+            if group:
+                yield background_token, group
+            continue
+
+        yield None, [item]
+        index += 1
 
 
 def rich_text_to_markdown(
@@ -318,13 +366,14 @@ def rich_text_to_markdown(
     preserve_bold: bool = True,
     default_color: Optional[str] = None,
 ) -> str:
-    """Convert Notion rich_text to Markdown while preserving text/background colors."""
+    """Convert Notion rich_text to Markdown while preserving inline formatting.
+
+    Adjacent runs with the same Notion background color share one outer span;
+    individual child runs retain their own bold/italic/link/code formatting.
+    """
     output: List[str] = []
 
-    for item in rich_text_list or []:
-        if not isinstance(item, dict):
-            continue
-
+    def render_item(item: Dict[str, Any], grouped_background: bool = False) -> str:
         text_data = item.get("text")
         if not isinstance(text_data, dict):
             text_data = {}
@@ -336,21 +385,24 @@ def rich_text_to_markdown(
             text_value = equation_data.get("expression", "") if isinstance(equation_data, dict) else ""
         text_value = str(text_value or "")
         if not text_value:
-            continue
+            return ""
 
         annotations = item.get("annotations", {}) or {}
-        color_style = rich_text_color_style(annotations, default_color)
+        effective_token = rich_text_color_token(annotations, default_color)
+        color_style = "" if grouped_background else notion_color_style(effective_token)
         has_html_formatting = (
             (preserve_bold and annotations.get("bold"))
             or annotations.get("italic")
             or annotations.get("strikethrough")
             or annotations.get("underline")
             or bool(color_style)
+            or grouped_background
         )
 
         if annotations.get("code"):
-            # Use HTML code when colored, otherwise keep native Markdown code spans.
-            if color_style:
+            # Use HTML code when inside a shared highlight; otherwise retain the
+            # Markdown code span when there is no color formatting.
+            if color_style or grouped_background:
                 value = f"<code>{html.escape(text_value, quote=False)}</code>"
             else:
                 value = inline_code_span(text_value)
@@ -373,14 +425,22 @@ def rich_text_to_markdown(
         if href:
             safe_href = safe_html_url(str(href))
             if safe_href:
-                # HTML anchors safely preserve colored/annotated runs.
+                # HTML anchors safely preserve colors and annotated runs.
                 if color_style or has_html_formatting:
                     value = f'<a href="{safe_href}">{value}</a>'
                 else:
                     escaped_href = str(href).replace("(", "%28").replace(")", "%29").replace(" ", "%20")
                     value = f"[{value}]({escaped_href})"
+        return value
 
-        output.append(value)
+    for background_token, group in iter_rich_text_groups(rich_text_list, default_color):
+        if background_token:
+            inner = "".join(render_item(item, grouped_background=True) for item in group)
+            if inner:
+                shared_style = notion_color_style(background_token)
+                output.append(f'<span class="notion-inline-highlight" style="{shared_style}">{inner}</span>')
+        else:
+            output.append(render_item(group[0]))
 
     return "".join(output)
 
@@ -1028,12 +1088,10 @@ def rich_text_to_html(
     rich_text_list: Optional[List[Dict[str, Any]]],
     default_color: Optional[str] = None,
 ) -> str:
-    """Render Notion rich_text as safe HTML, including foreground/background colors."""
+    """Render Notion rich_text as safe HTML with continuous background highlights."""
     output: List[str] = []
-    for item in rich_text_list or []:
-        if not isinstance(item, dict):
-            continue
 
+    def render_item(item: Dict[str, Any], grouped_background: bool = False) -> str:
         text_data = item.get("text") if isinstance(item.get("text"), dict) else {}
         raw_text = item.get("plain_text")
         if raw_text is None:
@@ -1043,7 +1101,7 @@ def rich_text_to_html(
             raw_text = equation_data.get("expression", "") if isinstance(equation_data, dict) else ""
         value = html.escape(str(raw_text or ""), quote=False).replace("\n", "<br>\n")
         if not value:
-            continue
+            return ""
 
         annotations = item.get("annotations", {}) or {}
         if annotations.get("code"):
@@ -1058,7 +1116,8 @@ def rich_text_to_html(
             if annotations.get("underline"):
                 value = f"<u>{value}</u>"
 
-        color_style = rich_text_color_style(annotations, default_color)
+        effective_token = rich_text_color_token(annotations, default_color)
+        color_style = "" if grouped_background else notion_color_style(effective_token)
         if color_style:
             value = f'<span style="{color_style}">{value}</span>'
 
@@ -1066,7 +1125,16 @@ def rich_text_to_html(
         href = safe_html_url(item.get("href") or link_data.get("url") or "")
         if href:
             value = f'<a href="{href}">{value}</a>'
-        output.append(value)
+        return value
+
+    for background_token, group in iter_rich_text_groups(rich_text_list, default_color):
+        if background_token:
+            inner = "".join(render_item(item, grouped_background=True) for item in group)
+            if inner:
+                shared_style = notion_color_style(background_token)
+                output.append(f'<span class="notion-inline-highlight" style="{shared_style}">{inner}</span>')
+        else:
+            output.append(render_item(group[0]))
 
     return "".join(output)
 
