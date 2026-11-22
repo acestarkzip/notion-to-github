@@ -34,7 +34,7 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.18-notion-number-order-toc-bullets-v3"
+EXPORTER_VERSION = "2026.11.22-yellow-highlight-v1"
 
 SAVE_DIR_ROOT = Path("TIL")
 ACTIVE_PAGES_MANIFEST = Path("notion-active-pages.json")
@@ -277,7 +277,8 @@ NOTION_BACKGROUND_COLOR_CSS = {
     "gray_background": "rgba(160,160,155,.20)",
     "brown_background": "rgba(169,115,83,.22)",
     "orange_background": "rgba(217,115,13,.22)",
-    "yellow_background": "rgba(203,145,47,.22)",
+    # Notion yellow highlight: vivid highlighter yellow for clear contrast on the dark blog theme.
+    "yellow_background": "#FFE600",
     "green_background": "rgba(68,131,97,.25)",
     "blue_background": "rgba(51,126,169,.24)",
     "purple_background": "rgba(144,101,176,.24)",
@@ -292,8 +293,11 @@ def notion_color_style(color: Optional[str]) -> str:
     if token in NOTION_TEXT_COLOR_HEX:
         return f"color:{NOTION_TEXT_COLOR_HEX[token]}"
     if token in NOTION_BACKGROUND_COLOR_CSS:
+        # A bright yellow highlight needs dark foreground text to remain readable.
+        foreground = "color:#111827;" if token == "yellow_background" else ""
         return (
             f"background-color:{NOTION_BACKGROUND_COLOR_CSS[token]};"
+            f"{foreground}"
             "border-radius:3px;padding:0 .15em;"
             "-webkit-box-decoration-break:clone;box-decoration-break:clone"
         )

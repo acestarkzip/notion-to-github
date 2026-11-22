@@ -402,7 +402,7 @@ def main():
     css_sanitizer = CSSSanitizer(allowed_css_properties={
         "box-sizing", "width", "max-width", "height", "margin", "display",
         "border-radius", "list-style-position", "padding", "line-height",
-        "border-left", "color", "font-size", "text-align", "vertical-align",
+        "border-left", "color", "background-color", "font-size", "text-align", "vertical-align",
         "scroll-margin-top",
     })
 
