@@ -34,7 +34,7 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.22-callout-icon-parity-v2"
+EXPORTER_VERSION = "2026.11.22-callout-emoji-green-highlight-v3"
 
 SAVE_DIR_ROOT = Path("TIL")
 ACTIVE_PAGES_MANIFEST = Path("notion-active-pages.json")
@@ -279,7 +279,8 @@ NOTION_BACKGROUND_COLOR_CSS = {
     "orange_background": "rgba(217,115,13,.22)",
     # Notion yellow highlight: vivid highlighter yellow for clear contrast on the dark blog theme.
     "yellow_background": "#FFE600",
-    "green_background": "rgba(68,131,97,.25)",
+    # Strong NVIDIA-style green highlighter for clearly visible inline emphasis.
+    "green_background": "#76B900",
     "blue_background": "rgba(51,126,169,.24)",
     "purple_background": "rgba(144,101,176,.24)",
     "pink_background": "rgba(193,76,138,.24)",
@@ -293,8 +294,8 @@ def notion_color_style(color: Optional[str]) -> str:
     if token in NOTION_TEXT_COLOR_HEX:
         return f"color:{NOTION_TEXT_COLOR_HEX[token]}"
     if token in NOTION_BACKGROUND_COLOR_CSS:
-        # A bright yellow highlight needs dark foreground text to remain readable.
-        foreground = "color:#111827;" if token == "yellow_background" else ""
+        # Bright yellow/green highlighters need dark foreground text, including bold runs.
+        foreground = "color:#111827;" if token in {"yellow_background", "green_background"} else ""
         return (
             f"background-color:{NOTION_BACKGROUND_COLOR_CSS[token]};"
             f"{foreground}"
@@ -1159,58 +1160,103 @@ def render_callout_icon_html(
     asset_dir: Path,
     asset_counter: List[int],
 ) -> str:
-    """Render the actual Notion callout icon without substituting a generic bulb."""
+    """Render the selected Notion callout icon across legacy and current API shapes.
+
+    Notion can return an emoji, a native named icon, a custom emoji, or an
+    uploaded/external image. Missing/unknown values are deliberately omitted;
+    they are never replaced with a misleading default lightbulb.
+    """
+    # Some callers/test fixtures may wrap the callout object one level deeper.
+    if not icon_data and isinstance(block, dict):
+        icon_data = block.get("icon")
+        if not icon_data and isinstance(block.get("callout"), dict):
+            icon_data = block["callout"].get("icon")
+
     if isinstance(icon_data, str):
-        return html.escape(icon_data, quote=False)
+        value = icon_data.strip()
+        if value:
+            return html.escape(value, quote=False)
+        return ""
     if not isinstance(icon_data, dict):
+        log(f">> [CALLOUT ICON] {block.get('id', 'unknown')}: missing icon data; no fallback icon inserted")
         return ""
 
-    icon_type = str(icon_data.get("type") or "").strip().lower()
-
-    # Standard Notion emoji icon. Also support older payloads without a type key.
+    # Current Notion responses use {type: 'emoji', emoji: '📌'} or
+    # {type: 'icon', name: 'pin', color: '...'}; tolerate wrapped variants too.
+    icon_type = str(icon_data.get("type") or icon_data.get("object") or "").strip().lower()
     emoji = icon_data.get("emoji")
+    if isinstance(emoji, dict):
+        emoji = emoji.get("emoji") or emoji.get("value") or emoji.get("name")
     if isinstance(emoji, str) and emoji.strip():
-        return html.escape(emoji, quote=False)
+        result = html.escape(emoji.strip(), quote=False)
+        log(f">> [CALLOUT ICON] {block.get('id', 'unknown')}: emoji={emoji.strip()} rendered")
+        return result
 
-    # Native named icons were added to Notion's icon fields. Map common names to
-    # their familiar emoji equivalent; a named pin must not become a lightbulb.
-    if icon_type == "icon":
-        name = str(icon_data.get("name") or "").strip().lower()
+    # Some serialized payloads wrap the selected icon data inside an "icon" key.
+    nested_icon = icon_data.get("icon")
+    if isinstance(nested_icon, dict) and not icon_data.get("name"):
+        nested_type = str(nested_icon.get("type") or "").strip().lower()
+        nested_emoji = nested_icon.get("emoji")
+        if isinstance(nested_emoji, str) and nested_emoji.strip():
+            log(f">> [CALLOUT ICON] {block.get('id', 'unknown')}: nested emoji={nested_emoji.strip()} rendered")
+            return html.escape(nested_emoji.strip(), quote=False)
+        if nested_type:
+            icon_data = nested_icon
+            icon_type = nested_type
+
+    if icon_type in {"icon", "native_icon", "built_in_icon", "builtin_icon"}:
+        name_value = icon_data.get("name") or icon_data.get("icon_name")
+        if not name_value and isinstance(icon_data.get("icon"), dict):
+            name_value = icon_data["icon"].get("name")
+        name = str(name_value or "").strip().lower()
         normalized = re.sub(r"[^a-z0-9]+", "", name)
-        if "pin" in normalized:
-            return "📌"
-        if "lightbulb" in normalized or normalized in {"bulb", "idea"}:
-            return "💡"
-        if "warning" in normalized or "alert" in normalized:
-            return "⚠️"
-        if "check" in normalized or "checkmark" in normalized:
-            return "✅"
-        if "star" in normalized:
-            return "⭐"
-        if "rocket" in normalized:
-            return "🚀"
-        if "robot" in normalized:
-            return "🤖"
+
+        # Keep common Notion native icons recognizable as their familiar symbols.
+        icon_aliases = {
+            "pin": "📌", "pushpin": "📌", "pinfilled": "📌", "pinned": "📌",
+            "lightbulb": "💡", "bulb": "💡", "idea": "💡",
+            "warning": "⚠️", "alert": "⚠️", "alerttriangle": "⚠️",
+            "check": "✅", "checkmark": "✅", "checkcircle": "✅",
+            "star": "⭐", "rocket": "🚀", "robot": "🤖",
+            "info": "ℹ️", "infocircle": "ℹ️", "question": "❔",
+            "book": "📚", "bookopen": "📖", "calendar": "📅",
+            "target": "🎯", "mail": "✉️", "globe": "🌐",
+            "sparkles": "✨", "flame": "🔥", "heart": "❤️",
+        }
+        rendered = icon_aliases.get(normalized)
+        if rendered:
+            log(f">> [CALLOUT ICON] {block.get('id', 'unknown')}: native icon name='{name}' mapped to {rendered}")
+            return rendered
+        log(f">> [CALLOUT ICON] {block.get('id', 'unknown')}: unsupported native icon '{name}'; no fallback inserted")
         return ""
 
-    # Custom emoji and uploaded/external icons are rendered as images. Notion-hosted
-    # file icons are downloaded into the page's asset folder to avoid expiring URLs.
+    # Custom emoji and uploaded/external icons are rendered as images.
     image_data: Dict[str, Any] = {}
-    if icon_type == "custom_emoji":
-        image_data = icon_data.get("custom_emoji", {}) or {}
+    if icon_type in {"custom_emoji", "customemoji"}:
+        image_data = icon_data.get("custom_emoji", {}) or icon_data.get("customEmoji", {}) or {}
     elif icon_type == "external":
-        image_data = icon_data.get("external", {}) or {}
-    elif icon_type == "file":
-        image_data = icon_data.get("file", {}) or {}
+        image_data = icon_data.get("external", {}) or icon_data
+    elif icon_type in {"file", "file_upload", "fileupload"}:
+        image_data = icon_data.get("file", {}) or icon_data.get("file_upload", {}) or icon_data.get("fileUpload", {}) or {}
 
     if not isinstance(image_data, dict):
+        log(f">> [CALLOUT ICON] {block.get('id', 'unknown')}: unsupported icon payload type '{icon_type}'")
         return ""
-    image_url = str(image_data.get("url") or "").strip()
+
+    image_url = str(image_data.get("url") or image_data.get("file_url") or "").strip()
     if not image_url:
+        # Workspace custom emoji records may have a recognizable name even if
+        # a URL is omitted in a cached/partial response.
+        custom_name = str(image_data.get("name") or "").strip().lower()
+        normalized_name = re.sub(r"[^a-z0-9]+", "", custom_name)
+        if normalized_name in {"pushpin", "pin", "roundpushpin"}:
+            log(f">> [CALLOUT ICON] {block.get('id', 'unknown')}: custom emoji name mapped to pin")
+            return "📌"
+        log(f">> [CALLOUT ICON] {block.get('id', 'unknown')}: image icon URL missing; no fallback inserted")
         return ""
 
     target = image_url
-    if icon_type == "file":
+    if icon_type in {"file", "file_upload", "fileupload"}:
         asset_counter[0] += 1
         local_path = download_notion_file(
             image_url,
@@ -1225,7 +1271,9 @@ def render_callout_icon_html(
 
     safe_src = safe_html_url(target)
     if not safe_src:
+        log(f">> [CALLOUT ICON] {block.get('id', 'unknown')}: icon URL rejected; no fallback inserted")
         return ""
+    log(f">> [CALLOUT ICON] {block.get('id', 'unknown')}: {icon_type or 'image'} rendered as image")
     return (
         f'<img class="notion-callout-icon-image" src="{safe_src}" '
         'alt="" aria-hidden="true">'
@@ -1318,8 +1366,11 @@ def render_blocks_as_html(
                 f'{f"<p style=\"margin:.25rem 0 .5rem;\">{content}</p>" if content else ""}{nested}</blockquote>\n'
             )
         elif block_type == "callout":
+            icon_data = data.get("icon")
+            if icon_data is None:
+                icon_data = block.get("icon")
             icon_html = render_callout_icon_html(
-                data.get("icon"), block, asset_dir, asset_counter
+                icon_data, block, asset_dir, asset_counter
             )
             # Keep title and child blocks together; show the Notion icon without a badge.
             nested = render_blocks_as_html(children, asset_dir, asset_counter, depth + 1)
