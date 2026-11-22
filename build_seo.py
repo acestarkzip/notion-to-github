@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build SEO-ready static article pages with native and resilient TOC navigation, BlogPosting JSON-LD, sitemap, and RSS from Notion index."""
+"""Build SEO-ready static article pages, BlogPosting JSON-LD, sitemap, and full-content RSS from Notion index."""
 from __future__ import annotations
 
 import argparse
@@ -28,121 +28,6 @@ RAW_ASSET_BASE = os.environ.get(
     "GITHUB_RAW_BASE_URL",
     "https://raw.githubusercontent.com/acestarkzip/acestarkzip.github.io/main",
 ).strip().rstrip("/")
-
-
-# Static article pages do not load js/post.js: the article HTML is already built
-# into /posts/<notion-page-id>/index.html. Keep TOC navigation self-contained so
-# it works on the published static page, including when a stale/missing target
-# ID has to be recovered from the visible TOC label.
-STATIC_TOC_NAV_SCRIPT = r"""<script>
-(() => {
-  "use strict";
-
-  const root = document.getElementById("markdown-content");
-  if (!root) return;
-
-  const headings = Array.from(root.querySelectorAll("h1, h2, h3, h4, h5, h6"));
-  const usedHeadings = new Set();
-  const tocLinks = Array.from(root.querySelectorAll('a[href^="#"]'));
-
-  const normalize = (value) => String(value || "")
-    .normalize("NFKC")
-    .replace(/[\u200B-\u200D\uFEFF]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  const comparable = (value) => normalize(value)
-    .toLocaleLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, "");
-
-  function getFragment(link) {
-    const href = link.getAttribute("href") || "";
-    const fragment = href.startsWith("#") ? href.slice(1) : "";
-    if (!fragment) return "";
-    try { return decodeURIComponent(fragment); } catch (_) { return fragment; }
-  }
-
-  function findTarget(link) {
-    const id = getFragment(link);
-    if (!id) return null;
-
-    const existing = document.getElementById(id);
-    if (existing && root.contains(existing)) return existing;
-
-    const label = normalize(link.textContent);
-    const labelKey = comparable(label);
-    if (!labelKey) return null;
-
-    let target = headings.find((heading) =>
-      !usedHeadings.has(heading) && normalize(heading.textContent) === label
-    );
-    if (!target) {
-      target = headings.find((heading) =>
-        !usedHeadings.has(heading) && comparable(heading.textContent) === labelKey
-      );
-    }
-    if (!target) return null;
-
-    target.id = id;
-    usedHeadings.add(target);
-    return target;
-  }
-
-  function prepareTargets() {
-    headings.forEach((heading) => {
-      heading.style.scrollMarginTop = "112px";
-    });
-    tocLinks.forEach(findTarget);
-  }
-
-  function scrollToTarget(target, updateAddress) {
-    if (!target) return;
-    if (updateAddress && target.id) {
-      const nextHash = `#${encodeURIComponent(target.id)}`;
-      if (window.location.hash !== nextHash) {
-        window.history.pushState(null, "", nextHash);
-      }
-    }
-    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    target.scrollIntoView({
-      behavior: reduceMotion ? "auto" : "smooth",
-      block: "start"
-    });
-  }
-
-  root.addEventListener("click", (event) => {
-    const origin = event.target instanceof Element ? event.target : event.target.parentElement;
-    const link = origin && origin.closest('a[href^="#"]');
-    if (!link || !root.contains(link)) return;
-
-    const target = findTarget(link);
-    if (!target) return;
-    event.preventDefault();
-    scrollToTarget(target, true);
-  });
-
-  function restoreHashPosition() {
-    const rawHash = window.location.hash.slice(1);
-    if (!rawHash) return;
-    let id = rawHash;
-    try { id = decodeURIComponent(rawHash); } catch (_) { /* keep raw hash */ }
-
-    let target = document.getElementById(id);
-    if (!target || !root.contains(target)) {
-      const matchingLink = tocLinks.find((link) => getFragment(link) === id);
-      if (matchingLink) target = findTarget(matchingLink);
-    }
-    if (target && root.contains(target)) {
-      requestAnimationFrame(() => requestAnimationFrame(() => scrollToTarget(target, false)));
-    }
-  }
-
-  prepareTargets();
-  window.addEventListener("hashchange", restoreHashPosition);
-  window.addEventListener("load", restoreHashPosition, { once: true });
-  if (window.location.hash) restoreHashPosition();
-})();
-</script>"""
 
 
 def esc(value):
@@ -222,6 +107,50 @@ def notion_tag_names(post):
     return names
 
 
+def protect_standalone_hashtag_rows(markdown_text):
+    """Keep hashtag-only rows as paragraphs instead of parsing the first # as an H1 marker.
+
+    Python-Markdown can interpret a line beginning with ``#Tag`` as a heading.
+    For a row that contains several hashtags, escape only the initial marker so
+    the literal first hashtag is preserved in the generated HTML. Fenced code
+    blocks are left untouched.
+    """
+    lines = str(markdown_text or "").splitlines(keepends=True)
+    fence_character = ""
+    fence_length = 0
+
+    for index, line in enumerate(lines):
+        fence = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if fence:
+            marker = fence.group(1)
+            if not fence_character:
+                fence_character = marker[0]
+                fence_length = len(marker)
+            elif marker[0] == fence_character and len(marker) >= fence_length:
+                fence_character = ""
+                fence_length = 0
+            continue
+
+        if fence_character:
+            continue
+
+        # Match a literal hashtag at the start (no whitespace after #).
+        # Require multiple tags to avoid changing ordinary short headings.
+        match = re.match(r"^([ \t]{0,3})(#)(?=\S)(.*?)(\r?\n)?$", line)
+        if not match:
+            continue
+
+        hashtag_row = match.group(2) + match.group(3)
+        hashtag_count = re.findall(r"(?<!\S)#[^\s#]+", hashtag_row)
+        if len(hashtag_count) < 3:
+            continue
+
+        newline = match.group(4) or ""
+        lines[index] = f"{match.group(1)}\\{hashtag_row}{newline}"
+
+    return "".join(lines)
+
+
 def attach_heading_anchor_ids(fragment):
     """Move legacy Notion anchors onto the next H1-H6 before Bleach sanitizes HTML."""
     anchor = r'<a\b[^>]*\bname=["\'](?P<name>notion-heading-[0-9a-f]{32})["\'][^>]*>\s*</a>'
@@ -246,14 +175,13 @@ def attach_heading_anchor_ids(fragment):
         else:
             heading_tag = heading_tag[:-1] + f' id="{esc(anchor_id)}">'
 
-        # The root scroll-padding (88px in style.css) accounts for the sticky header;
-        # keep only a small 16px breathing gap after the header.
+        # Avoid having the sticky navigation cover the target heading.
         if re.search(r'\bstyle=["\']', heading_tag, re.I):
             heading_tag = re.sub(
                 r'\bstyle=(["\'])(.*?)\1',
                 lambda style_match: (
                     f'style={style_match.group(1)}'
-                    f'{style_match.group(2).rstrip("; ")};scroll-margin-top:0px'
+                    f'{style_match.group(2).rstrip("; ")};scroll-margin-top:112px'
                     f'{style_match.group(1)}'
                 ),
                 heading_tag,
@@ -261,7 +189,7 @@ def attach_heading_anchor_ids(fragment):
                 flags=re.I,
             )
         else:
-            heading_tag = heading_tag[:-1] + ' style="scroll-margin-top:0px">'
+            heading_tag = heading_tag[:-1] + ' style="scroll-margin-top:112px">'
         converted += 1
         return heading_tag
 
@@ -493,7 +421,8 @@ def main():
         date = str(post.get("date") or "")
         raw = md_file.read_text(encoding="utf-8")
         desc = description_from(raw, post.get("memo", ""))
-        body = markdown.markdown(raw, extensions=["extra", "sane_lists", "nl2br"])
+        markdown_for_html = protect_standalone_hashtag_rows(raw)
+        body = markdown.markdown(markdown_for_html, extensions=["extra", "sane_lists", "nl2br"])
         # The first H1 is the document title rendered in the page header, not body content.
         body = re.sub(r"<h1\b[^>]*>.*?</h1>\s*", "", body, count=1, flags=re.I | re.S)
         body, anchor_count, toc_link_count = attach_heading_anchor_ids(body)
@@ -599,19 +528,7 @@ def main():
         )
         loading = '<div class="loading-state"><span class="loading-ring" aria-hidden="true"></span><span>Markdown을 불러오는 중입니다...</span></div>'
         page = page.replace(loading, body)
-        # Static SEO pages contain the rendered article HTML, so the dynamic
-        # post.js loader is intentionally removed. Add a lightweight, self-contained
-        # navigation handler for the static page's TOC links instead.
         page = page.replace('<script src="/js/post.js" defer></script>', "")
-        if "</body>" not in page.lower():
-            raise RuntimeError(f"post.html template has no closing body tag: {page_id}")
-        page = re.sub(
-            r"</body>",
-            lambda _match: STATIC_TOC_NAV_SCRIPT + "\n</body>",
-            page,
-            count=1,
-            flags=re.I,
-        )
 
         out = root / "posts" / page_id / "index.html"
         out.parent.mkdir(parents=True, exist_ok=True)
