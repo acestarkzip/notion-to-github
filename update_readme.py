@@ -34,7 +34,7 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.22-callout-inline-color-scope-v1"
+EXPORTER_VERSION = "2026.11.22-callout-icon-parity-v2"
 
 SAVE_DIR_ROOT = Path("TIL")
 ACTIVE_PAGES_MANIFEST = Path("notion-active-pages.json")
@@ -1152,6 +1152,86 @@ def render_media_block_html(
     return f'<p><a href="{safe_target}">📎 {html.escape(label)}</a></p>\n'
 
 
+
+def render_callout_icon_html(
+    icon_data: Any,
+    block: Dict[str, Any],
+    asset_dir: Path,
+    asset_counter: List[int],
+) -> str:
+    """Render the actual Notion callout icon without substituting a generic bulb."""
+    if isinstance(icon_data, str):
+        return html.escape(icon_data, quote=False)
+    if not isinstance(icon_data, dict):
+        return ""
+
+    icon_type = str(icon_data.get("type") or "").strip().lower()
+
+    # Standard Notion emoji icon. Also support older payloads without a type key.
+    emoji = icon_data.get("emoji")
+    if isinstance(emoji, str) and emoji.strip():
+        return html.escape(emoji, quote=False)
+
+    # Native named icons were added to Notion's icon fields. Map common names to
+    # their familiar emoji equivalent; a named pin must not become a lightbulb.
+    if icon_type == "icon":
+        name = str(icon_data.get("name") or "").strip().lower()
+        normalized = re.sub(r"[^a-z0-9]+", "", name)
+        if "pin" in normalized:
+            return "📌"
+        if "lightbulb" in normalized or normalized in {"bulb", "idea"}:
+            return "💡"
+        if "warning" in normalized or "alert" in normalized:
+            return "⚠️"
+        if "check" in normalized or "checkmark" in normalized:
+            return "✅"
+        if "star" in normalized:
+            return "⭐"
+        if "rocket" in normalized:
+            return "🚀"
+        if "robot" in normalized:
+            return "🤖"
+        return ""
+
+    # Custom emoji and uploaded/external icons are rendered as images. Notion-hosted
+    # file icons are downloaded into the page's asset folder to avoid expiring URLs.
+    image_data: Dict[str, Any] = {}
+    if icon_type == "custom_emoji":
+        image_data = icon_data.get("custom_emoji", {}) or {}
+    elif icon_type == "external":
+        image_data = icon_data.get("external", {}) or {}
+    elif icon_type == "file":
+        image_data = icon_data.get("file", {}) or {}
+
+    if not isinstance(image_data, dict):
+        return ""
+    image_url = str(image_data.get("url") or "").strip()
+    if not image_url:
+        return ""
+
+    target = image_url
+    if icon_type == "file":
+        asset_counter[0] += 1
+        local_path = download_notion_file(
+            image_url,
+            str(block.get("id") or "callout-icon"),
+            asset_dir,
+            preferred_name="callout-icon",
+            asset_index=asset_counter[0],
+            asset_kind="image",
+        )
+        if local_path:
+            target = local_path
+
+    safe_src = safe_html_url(target)
+    if not safe_src:
+        return ""
+    return (
+        f'<img class="notion-callout-icon-image" src="{safe_src}" '
+        'alt="" aria-hidden="true">'
+    )
+
+
 def render_blocks_as_html(
     blocks: Iterable[Dict[str, Any]],
     asset_dir: Path,
@@ -1238,13 +1318,16 @@ def render_blocks_as_html(
                 f'{f"<p style=\"margin:.25rem 0 .5rem;\">{content}</p>" if content else ""}{nested}</blockquote>\n'
             )
         elif block_type == "callout":
-            icon_data = data.get("icon", {}) or {}
-            icon = icon_data.get("emoji") or "💡"
-            # Keep the title and every child block in the same text column.
-            # This mirrors Notion's icon + content layout and prevents paragraphs,
-            # spacers, and lists from jumping back to the card's left padding.
+            icon_html = render_callout_icon_html(
+                data.get("icon"), block, asset_dir, asset_counter
+            )
+            # Keep title and child blocks together; show the Notion icon without a badge.
             nested = render_blocks_as_html(children, asset_dir, asset_counter, depth + 1)
             body = f'{content}{nested}'
+            icon_column = (
+                f'<span class="notion-callout-icon" aria-hidden="true">{icon_html}</span>'
+                if icon_html else ""
+            )
             output.append(
                 '<div class="notion-callout" style="box-sizing:border-box;display:block;'
                 'width:100%;max-width:100%;margin:1.1rem 0;padding:1rem 1.25rem;'
@@ -1252,7 +1335,7 @@ def render_blocks_as_html(
                 'border-left:4px solid #76b900;border-radius:10px;color:inherit;line-height:1.55;">'
                 '<div class="notion-callout-layout" style="display:flex;align-items:flex-start;'
                 'gap:.65rem;width:100%;min-width:0;">'
-                f'<span aria-hidden="true" style="flex:0 0 auto;line-height:1.55;">{html.escape(str(icon))}</span>'
+                f'{icon_column}'
                 f'<div class="notion-callout-content" style="box-sizing:border-box;flex:1 1 auto;'
                 f'min-width:0;width:100%;">{body}</div>'
                 '</div></div>\n'
