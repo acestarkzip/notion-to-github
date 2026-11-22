@@ -34,7 +34,8 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.22-richtext-highlight-linebox-v5"
+EXPORTER_VERSION = "2026.11.22-richtext-highlight-boundary-v6"
+HIGHLIGHT_BACKGROUND_POLICY = "explicit annotations only; default_background is not an inline highlight"
 
 SAVE_DIR_ROOT = Path("TIL")
 ACTIVE_PAGES_MANIFEST = Path("notion-active-pages.json")
@@ -299,9 +300,7 @@ def notion_color_style(color: Optional[str]) -> str:
         return (
             f"background-color:{NOTION_BACKGROUND_COLOR_CSS[token]};"
             f"{foreground}"
-            # A shared line-height plus vertical padding keeps the highlight band
-            # visually even when bold and regular runs share the same background.
-            "border-radius:3px;padding:.12em .16em;line-height:1.65em;vertical-align:baseline;"
+            "border-radius:3px;padding:0 .15em;"
             "-webkit-box-decoration-break:clone;box-decoration-break:clone"
         )
     return ""
@@ -316,8 +315,24 @@ def rich_text_color_token(annotations: Dict[str, Any], default_color: Optional[s
 
 
 def rich_text_color_style(annotations: Dict[str, Any], default_color: Optional[str] = None) -> str:
-    """Prefer per-run color; fall back to the containing Notion block color."""
-    return notion_color_style(rich_text_color_token(annotations, default_color))
+    """Resolve visible rich-text styling without treating the default background as a highlight.
+
+    Notion may return ``default_background`` for an unhighlighted run or as a
+    block-level fallback. It represents the absence of an explicit inline
+    highlight in this renderer, so it must never create a colored text patch.
+    """
+    token = rich_text_color_token(annotations, default_color)
+    if token == "default_background":
+        return ""
+    return notion_color_style(token)
+
+
+# Only explicit non-default background annotations create inline highlight groups.
+# ``default_background`` is intentionally excluded: it is not a user-selected
+# text highlight and otherwise paints unformatted text with a faint rectangle.
+NOTION_INLINE_HIGHLIGHT_TOKENS = frozenset(
+    token for token in NOTION_BACKGROUND_COLOR_CSS if token != "default_background"
+)
 
 
 def iter_rich_text_groups(
@@ -341,7 +356,7 @@ def iter_rich_text_groups(
 
         annotations = item.get("annotations", {}) or {}
         token = rich_text_color_token(annotations, default_color)
-        background_token = token if token in NOTION_BACKGROUND_COLOR_CSS else None
+        background_token = token if token in NOTION_INLINE_HIGHLIGHT_TOKENS else None
 
         if background_token:
             group: List[Dict[str, Any]] = []
@@ -391,7 +406,7 @@ def rich_text_to_markdown(
 
         annotations = item.get("annotations", {}) or {}
         effective_token = rich_text_color_token(annotations, default_color)
-        color_style = "" if grouped_background else notion_color_style(effective_token)
+        color_style = "" if grouped_background else rich_text_color_style(annotations, default_color)
         has_html_formatting = (
             (preserve_bold and annotations.get("bold"))
             or annotations.get("italic")
@@ -1119,7 +1134,7 @@ def rich_text_to_html(
                 value = f"<u>{value}</u>"
 
         effective_token = rich_text_color_token(annotations, default_color)
-        color_style = "" if grouped_background else notion_color_style(effective_token)
+        color_style = "" if grouped_background else rich_text_color_style(annotations, default_color)
         if color_style:
             value = f'<span style="{color_style}">{value}</span>'
 
