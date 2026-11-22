@@ -34,8 +34,8 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.22-richtext-highlight-boundary-v6"
-HIGHLIGHT_BACKGROUND_POLICY = "explicit annotations only; default_background is not an inline highlight"
+EXPORTER_VERSION = "2026.11.22-richtext-highlight-boundary-v7"
+HIGHLIGHT_BACKGROUND_POLICY = "inline backgrounds come only from explicit per-run annotations; block background fallback is disabled"
 
 SAVE_DIR_ROOT = Path("TIL")
 ACTIVE_PAGES_MANIFEST = Path("notion-active-pages.json")
@@ -307,11 +307,24 @@ def notion_color_style(color: Optional[str]) -> str:
 
 
 def rich_text_color_token(annotations: Dict[str, Any], default_color: Optional[str] = None) -> str:
-    """Return the effective Notion color token for one rich-text run."""
+    """Return a rich-text run's color without inheriting block-level backgrounds.
+
+    Notion's block-level ``color`` controls the paragraph/list/callout container,
+    not every inline text run. Earlier versions used it as a fallback for each
+    run; that made unhighlighted words inherit gray/green background patches in
+    some posts. Inline background highlights must therefore come only from the
+    run's explicit ``annotations.color``. A block-level *foreground* text color
+    is still retained for compatibility, but block-level background tokens are
+    intentionally not inherited by inline text.
+    """
     color = annotations.get("color")
-    if not color or color == "default":
-        color = default_color
-    return str(color or "default").strip().lower()
+    if color and str(color).strip().lower() not in {"default", "default_background"}:
+        return str(color).strip().lower()
+
+    fallback = str(default_color or "default").strip().lower()
+    if fallback in NOTION_TEXT_COLOR_HEX:
+        return fallback
+    return "default"
 
 
 def rich_text_color_style(annotations: Dict[str, Any], default_color: Optional[str] = None) -> str:
