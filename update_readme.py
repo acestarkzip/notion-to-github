@@ -34,7 +34,7 @@ import requests
 # [사용자 설정 영역]
 # =======================================================
 
-EXPORTER_VERSION = "2026.11.22-yellow-highlight-v1"
+EXPORTER_VERSION = "2026.11.22-callout-inline-color-scope-v1"
 
 SAVE_DIR_ROOT = Path("TIL")
 ACTIVE_PAGES_MANIFEST = Path("notion-active-pages.json")
@@ -1173,7 +1173,12 @@ def render_blocks_as_html(
         data = block.get(block_type, {}) or {}
         rich = data.get("rich_text", []) or []
         block_color = data.get("color")
-        content = rich_text_to_html(rich, default_color=block_color)
+        # Callout.color styles the outer Notion callout container. It is not an
+        # inline rich-text highlight. Passing it as a fallback made every uncolored
+        # title run appear highlighted on the GitHub page. Per-run annotations
+        # (for example yellow_background) are still preserved by rich_text_to_html.
+        inline_default_color = None if block_type == "callout" else block_color
+        content = rich_text_to_html(rich, default_color=inline_default_color)
         children = block.get("_children", []) or []
 
         # Group adjacent list items while retaining nested children inside each item.
@@ -1340,7 +1345,12 @@ def render_blocks(
         # 제목은 #~###### 자체로 시각적 강조가 적용되므로,
         # Notion의 굵게 서식까지 **로 중복 변환하지 않습니다.
         is_heading = block_type in {"heading_1", "heading_2", "heading_3", "heading_4", "heading_5", "heading_6"}
-        content = rich_text_to_markdown(rich, preserve_bold=not is_heading, default_color=data.get("color"))
+        # A callout's color belongs to its panel, not to its uncolored rich-text runs.
+        # Explicit per-run Notion annotations remain intact.
+        inline_default_color = None if block_type == "callout" else data.get("color")
+        content = rich_text_to_markdown(
+            rich, preserve_bold=not is_heading, default_color=inline_default_color
+        )
         children = block.get("_children", []) or []
 
         if block_type == "paragraph":
