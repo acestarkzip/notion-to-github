@@ -34,6 +34,80 @@ def esc(value):
     return html.escape(str(value or ""), quote=True)
 
 
+SITE_FAVICON_BLOCK = (
+    '  <!-- SSS Robotics official favicon: use one stable site-wide icon -->\n'
+    '  <link rel="icon" type="image/png" href="/favicon.png">\n'
+    '  <link rel="apple-touch-icon" href="/favicon.png">'
+)
+
+
+def normalize_site_favicon_links(page, page_id="unknown"):
+    """Emit the same stable favicon links on every generated article page.
+
+    The homepage uses /favicon.png. Generated post pages must use that exact
+    URL too, rather than a dated query-string URL or stale ICO declaration.
+    Existing icon-related links in post.html are removed first so repeated
+    builds cannot accumulate duplicate declarations.
+    """
+    def keep_non_icon_link(match):
+        tag = match.group(0)
+        rel_match = re.search(
+            r"\brel\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))",
+            tag,
+            flags=re.I,
+        )
+        if not rel_match:
+            return tag
+
+        rel_value = next((value for value in rel_match.groups() if value is not None), "")
+        rel_tokens = [token.lower() for token in rel_value.split()]
+        is_icon_link = any(
+            token in {"icon", "mask-icon", "fluid-icon"}
+            or token.startswith("apple-touch-icon")
+            for token in rel_tokens
+        )
+        return "" if is_icon_link else tag
+
+    # Remove icon declarations regardless of attribute order or quote style.
+    page = re.sub(r"<link\b[^>]*>", keep_non_icon_link, page, flags=re.I)
+    # Remove comments from earlier favicon patches before adding the canonical one.
+    page = re.sub(
+        r"<!--[ \t]*SSS Robotics (?:current brand favicon[^>]*|official favicon[^>]*)-->[ \t]*\n?",
+        "",
+        page,
+        flags=re.I,
+    )
+
+    head_end = re.search(r"</head\s*>", page, flags=re.I)
+    if not head_end:
+        raise RuntimeError(f"post.html has no closing head tag while building {page_id}")
+
+    page = page[:head_end.start()] + SITE_FAVICON_BLOCK + "\n" + page[head_end.start():]
+
+    # Guard against accidental duplicate favicon output if this helper changes later.
+    icon_links = re.findall(r"<link\b[^>]*>", page, flags=re.I)
+    icon_rel_values = []
+    for tag in icon_links:
+        rel_match = re.search(
+            r"\brel\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))",
+            tag,
+            flags=re.I,
+        )
+        if rel_match:
+            rel_value = next((value for value in rel_match.groups() if value is not None), "")
+            if any(
+                token.lower() == "icon" or token.lower().startswith("apple-touch-icon")
+                for token in rel_value.split()
+            ):
+                icon_rel_values.append(rel_value.lower())
+    if sorted(icon_rel_values) != ["apple-touch-icon", "icon"]:
+        raise RuntimeError(
+            f"Unexpected favicon declarations for {page_id}: {icon_rel_values!r}"
+        )
+
+    return page
+
+
 def safe_slug(page_id):
     value = re.sub(r"[^0-9a-fA-F-]", "", str(page_id or ""))
     if len(value.replace("-", "")) != 32:
@@ -509,17 +583,8 @@ def main():
             f"<title>{esc(title)} | {BRAND}</title>",
         )
         page = page.replace('href="./', 'href="/').replace('src="./', 'src="/')
-        # Keep generated article pages on the same current favicon as the site root.
-        favicon_block = (
-            '  <!-- SSS Robotics current brand favicon (cache-busted) -->\n'
-            '  <link rel="icon" href="/favicon.ico?v=20261118" sizes="any">\n'
-            '  <link rel="icon" type="image/png" href="/favicon.png?v=20261118">\n'
-            '  <link rel="shortcut icon" href="/favicon.ico?v=20261118">\n'
-            '  <link rel="apple-touch-icon" href="/favicon.png?v=20261118">'
-        )
-        page = re.sub(r'\s*<link\s+rel="(?:shortcut icon|icon)"[^>]*>', '', page, flags=re.I)
-        page = page.replace('<meta name="theme-color" content="#080b09">',
-                            '<meta name="theme-color" content="#080b09">\n' + favicon_block, 1)
+        # Keep every generated article on the exact same stable favicon URL as the homepage.
+        page = normalize_site_favicon_links(page, page_id)
         page = page.replace('href="/index.html#', 'href="/#')
         page = page.replace("게시글을 불러오는 중입니다...", esc(title))
         page = page.replace(
